@@ -1212,6 +1212,13 @@ func (db *DB) init(ctx context.Context) (err error) {
 		}
 	}
 
+	// A reopened database may have missed replica files written while it was
+	// closed, and the behind-replica check uploads one without caching it, so
+	// compaction reads each level's position from the replica again.
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.Unlock()
+
 	// If we have an existing replication files, ensure the headers match.
 	// if err := db.verifyHeadersMatch(); err != nil {
 	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
