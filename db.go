@@ -85,6 +85,10 @@ type DB struct {
 	maxLTXFileInfos struct {
 		sync.Mutex
 		m map[int]*ltx.FileInfo
+
+		// The inputs of the last L0 retention run that left no file to age
+		// past retention. Nil until such a run.
+		l0RetentionSettled *l0RetentionKey
 	}
 
 	// Cached position from the latest L0 LTX file.
@@ -617,6 +621,7 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	// Clear cached LTX file info
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.l0RetentionSettled = nil
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
@@ -1217,6 +1222,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// compaction reads each level's position from the replica again.
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.l0RetentionSettled = nil
 	db.maxLTXFileInfos.Unlock()
 
 	// If we have an existing replication files, ensure the headers match.
@@ -3233,6 +3239,11 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
+	key, keyed := db.l0RetentionKey()
+	if keyed && db.l0RetentionSettledAt(key) {
+		return nil
+	}
+
 	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
 
 	dbName := filepath.Base(db.Path())
@@ -3249,6 +3260,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			maxL1TXID = info.MaxTXID
 		}
 	}
+	keyed = keyed && itr.Err() == nil
 	if err := itr.Close(); err != nil {
 		return fmt.Errorf("close l1 iterator: %w", err)
 	}
@@ -3256,6 +3268,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(0)
+		if keyed {
+			db.settleL0Retention(key)
+		}
 		return nil
 	}
 
@@ -3326,7 +3341,11 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		"too_recent", tooRecentCount,
 		"max_l1_txid", maxL1TXID)
 
+	keyed = keyed && itr.Err() == nil
 	if len(deleted) == 0 {
+		if keyed && processedAll {
+			db.settleL0Retention(key)
+		}
 		return nil
 	}
 
@@ -3349,7 +3368,50 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
+	if keyed && processedAll {
+		db.settleL0Retention(key)
+	}
 	return nil
+}
+
+// l0RetentionKey holds what decides which L0 files retention deletes: the
+// cached L0 and L1 max TXIDs, the replica's uploaded position, and the
+// retention settings. A sync, upload or compaction changes one of them.
+type l0RetentionKey struct {
+	l0, uploaded, l1 ltx.TXID
+	retention        time.Duration
+	deletes          bool
+}
+
+func (db *DB) l0RetentionKey() (l0RetentionKey, bool) {
+	uploaded := db.Replica.Pos().TXID
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	l0, ok0 := db.maxLTXFileInfos.m[0]
+	l1, ok1 := db.maxLTXFileInfos.m[1]
+	if !ok0 || !ok1 {
+		return l0RetentionKey{}, false
+	}
+	return l0RetentionKey{
+		l0:        l0.MaxTXID,
+		uploaded:  uploaded,
+		l1:        l1.MaxTXID,
+		retention: db.L0Retention,
+		deletes:   db.RetentionEnabled,
+	}, true
+}
+
+func (db *DB) l0RetentionSettledAt(key l0RetentionKey) bool {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	settled := db.maxLTXFileInfos.l0RetentionSettled
+	return settled != nil && *settled == key
+}
+
+func (db *DB) settleL0Retention(key l0RetentionKey) {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	db.maxLTXFileInfos.l0RetentionSettled = &key
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below
