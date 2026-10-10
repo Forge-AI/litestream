@@ -412,6 +412,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: StallTimeout,
 	}
 
 	// Configure TLS to skip verification if requested
@@ -420,6 +421,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			InsecureSkipVerify: true,
 		}
 	}
+	httpClient.Transport = stallBoundTransport{RoundTripper: httpClient.Transport, idle: StallTimeout}
 
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
@@ -1932,4 +1934,43 @@ func parseS3DebugEnv() aws.ClientLogMode {
 		}
 	}
 	return logMode
+}
+
+// StallTimeout bounds how long a request may wait for response headers and how
+// long a response body may send nothing before the request fails. The client's
+// 24-hour timeout otherwise lets a connection that stops sending hang a restore.
+const StallTimeout = time.Minute
+
+var errBodyStalled = errors.New("s3: response body stalled")
+
+type stallBoundTransport struct {
+	http.RoundTripper
+	idle time.Duration
+}
+
+func (t stallBoundTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.RoundTripper.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = &stallBoundBody{body: resp.Body, idle: t.idle}
+	return resp, nil
+}
+
+type stallBoundBody struct {
+	body io.ReadCloser
+	idle time.Duration
+}
+
+func (b *stallBoundBody) Read(p []byte) (int, error) {
+	timer := time.AfterFunc(b.idle, func() { b.body.Close() })
+	n, err := b.body.Read(p)
+	if !timer.Stop() {
+		return n, fmt.Errorf("%w: no bytes for %s", errBodyStalled, b.idle)
+	}
+	return n, err
+}
+
+func (b *stallBoundBody) Close() error {
+	return b.body.Close()
 }
