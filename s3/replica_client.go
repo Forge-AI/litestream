@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
@@ -460,6 +461,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
 			o.UseARNRegion = true
+			o.HTTPSignerV4 = unsignedRangeSigner{v4.NewSigner()}
 			// Add User-Agent and optional middleware.
 			o.APIOptions = append(o.APIOptions, c.middlewareOption())
 		},
@@ -691,7 +693,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	var rangeStr string
 	if size > 0 {
 		rangeStr = fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)
-	} else {
+	} else if offset > 0 {
 		rangeStr = fmt.Sprintf("bytes=%d-", offset)
 	}
 
@@ -702,7 +704,9 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
-		Range:  aws.String(rangeStr),
+	}
+	if rangeStr != "" {
+		input.Range = aws.String(rangeStr)
 	}
 
 	// Add SSE-C parameters if configured (required for reading SSE-C encrypted objects)
@@ -720,7 +724,51 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		}
 		return nil, fmt.Errorf("s3: get object %s: %w", key, err)
 	}
+	response := awsmiddleware.GetRawResponse(out.ResultMetadata).(*smithyhttp.Response)
+	switch response.StatusCode {
+	case http.StatusOK:
+		if contentRange := aws.ToString(out.ContentRange); contentRange != "" {
+			_ = out.Body.Close()
+			return nil, fmt.Errorf("s3: get object %s: full response has Content-Range %q", key, contentRange)
+		}
+		if _, err := io.CopyN(io.Discard, out.Body, offset); err != nil {
+			_ = out.Body.Close()
+			return nil, fmt.Errorf("s3: get object %s: skip to offset %d: %w", key, offset, err)
+		}
+	case http.StatusPartialContent:
+		var start, end, total int64
+		contentRange := aws.ToString(out.ContentRange)
+		_, err := fmt.Sscanf(contentRange, "bytes %d-%d/%d", &start, &end, &total)
+		wantEnd := total - 1
+		if size > 0 {
+			wantEnd = min(wantEnd, offset+size-1)
+		}
+		if err != nil || start != offset || end != wantEnd || end < start || total <= end || out.ContentLength != nil && *out.ContentLength != end-start+1 {
+			_ = out.Body.Close()
+			return nil, fmt.Errorf("s3: get object %s: unexpected Content-Range %q for offset %d, size %d", key, contentRange, offset, size)
+		}
+	default:
+		_ = out.Body.Close()
+		return nil, fmt.Errorf("s3: get object %s: unexpected status %d", key, response.StatusCode)
+	}
+	if size > 0 {
+		return internal.LimitReadCloser(out.Body, size), nil
+	}
 	return out.Body, nil
+}
+
+type unsignedRangeSigner struct {
+	*v4.Signer
+}
+
+func (s unsignedRangeSigner) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash, service, region string, at time.Time, options ...func(*v4.SignerOptions)) error {
+	rangeValue := req.Header.Get("Range")
+	req.Header.Del("Range")
+	err := s.Signer.SignHTTP(ctx, credentials, req, payloadHash, service, region, at, options...)
+	if rangeValue != "" {
+		req.Header.Set("Range", rangeValue)
+	}
+	return err
 }
 
 // WriteLTXFile writes an LTX file to the replica.
