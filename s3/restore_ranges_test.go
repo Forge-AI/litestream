@@ -15,13 +15,13 @@ import (
 	"time"
 
 	litestream "github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
 )
 
-func TestReplica_Restore_BoundedS3Ranges(t *testing.T) {
+func TestReplica_Restore_S3Streams(t *testing.T) {
 	const pageSize = 4096
 	const pageCount = 1024
+	const cutoff = 1 << 20
 	want := make([]byte, pageSize*pageCount)
 	_, _ = rand.New(rand.NewSource(1)).Read(want)
 	var encoded bytes.Buffer
@@ -46,63 +46,55 @@ func TestReplica_Restore_BoundedS3Ranges(t *testing.T) {
 	}
 	data := encoded.Bytes()
 	const key = "replica/0009/0000000000000001-0000000000000001.ltx"
-	for _, mode := range []string{"dropped", "stripped", "denied"} {
-		denied := mode == "denied"
+	for _, mode := range []string{"healthy", "dropped", "stripped", "denied"} {
 		t.Run(mode, func(t *testing.T) {
 			var mu sync.Mutex
-			var ranges [][2]int64
-			dropped := make(map[int64]bool)
+			var offsets []int64
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Query().Get("list-type") == "2" {
 					w.Header().Set("Content-Type", "application/xml")
 					_, _ = fmt.Fprintf(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-10-14T00:00:00Z</LastModified></Contents></ListBucketResult>`, key, len(data))
 					return
 				}
-				if denied {
+				if mode == "denied" {
 					w.Header().Set("Content-Type", "application/xml")
 					w.WriteHeader(http.StatusForbidden)
 					_, _ = fmt.Fprint(w, `<Error><Code>AccessDenied</Code><Message>source provision read denied</Message></Error>`)
 					return
 				}
-				var start, end int64
-				if _, err := fmt.Sscanf(r.Header.Get("Range"), "bytes=%d-%d", &start, &end); err != nil || end-start+1 > internal.LTXReadChunkSize {
-					w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write(data[:64*1024])
-					return
+				if strings.Contains(r.Header.Get("Authorization"), ";range;") {
+					t.Error("Range is bound into the request signature")
 				}
-				if start < 0 || end >= int64(len(data)) || end < start {
+				var start int64
+				if value := r.Header.Get("Range"); value != "" {
+					if _, err := fmt.Sscanf(value, "bytes=%d-", &start); err != nil {
+						t.Error(err)
+						w.WriteHeader(http.StatusBadRequest)
+						return
+					}
+				}
+				mu.Lock()
+				offsets = append(offsets, start)
+				first := len(offsets) == 1
+				mu.Unlock()
+				if mode == "stripped" {
+					r.Header.Del("Range")
+					start = 0
+				}
+				if start < 0 || start >= int64(len(data)) {
 					w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 					return
 				}
-				mu.Lock()
-				ranges = append(ranges, [2]int64{start, end})
-				chunk := start / internal.LTXReadChunkSize
-				drop := !dropped[chunk] && end-start+1 > 64*1024
-				if drop {
-					dropped[chunk] = true
+				w.Header().Set("Content-Length", fmt.Sprint(int64(len(data))-start))
+				if r.Header.Get("Range") != "" {
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, len(data)-1, len(data)))
+					w.WriteHeader(http.StatusPartialContent)
 				}
-				mu.Unlock()
-				if mode == "stripped" {
-					if strings.Contains(r.Header.Get("Authorization"), ";range;") {
-						w.WriteHeader(http.StatusForbidden)
-						_, _ = fmt.Fprint(w, `<Error><Code>SignatureDoesNotMatch</Code></Error>`)
-						return
-					}
-					r.Header.Del("Range")
-					w.Header().Set("Content-Length", fmt.Sprint(len(data)))
-					w.WriteHeader(http.StatusOK)
-					_, _ = w.Write(data)
-					return
+				end := int64(len(data))
+				if mode == "dropped" || mode == "stripped" && first {
+					end = min(end, start+cutoff)
 				}
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
-				w.Header().Set("Content-Length", fmt.Sprint(end-start+1))
-				w.WriteHeader(http.StatusPartialContent)
-				if drop {
-					_, _ = w.Write(data[start : start+64*1024])
-					return
-				}
-				_, _ = w.Write(data[start : end+1])
+				_, _ = w.Write(data[start:end])
 			}))
 			t.Cleanup(server.Close)
 			client := NewReplicaClient()
@@ -113,7 +105,7 @@ func TestReplica_Restore_BoundedS3Ranges(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 			defer cancel()
 			err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, litestream.RestoreOptions{OutputPath: output, TXID: 1})
-			if denied {
+			if mode == "denied" {
 				if err == nil || !strings.Contains(err.Error(), "max retries exceeded") || !strings.Contains(err.Error(), "AccessDenied") || !strings.Contains(err.Error(), "source provision read denied") {
 					t.Fatalf("restore error lost cause: %v", err)
 				}
@@ -131,17 +123,24 @@ func TestReplica_Restore_BoundedS3Ranges(t *testing.T) {
 			}
 			mu.Lock()
 			defer mu.Unlock()
-			if mode == "stripped" {
-				if len(ranges) < 4 || ranges[1][0] != internal.LTXReadChunkSize {
-					t.Fatalf("full responses did not preserve ranged offsets: %v", ranges)
+			switch mode {
+			case "healthy":
+				if len(offsets) != 1 || offsets[0] != 0 {
+					t.Fatalf("healthy restore issued GETs at %v, want one full-object GET", offsets)
 				}
-				return
-			}
-			if len(dropped) < 4 {
-				t.Fatalf("only %d chunks dropped", len(dropped))
-			}
-			if len(ranges) < 2 || ranges[0] != [2]int64{0, internal.LTXReadChunkSize - 1} || ranges[1] != [2]int64{64 * 1024, internal.LTXReadChunkSize - 1} {
-				t.Fatalf("restore did not resume at last delivered byte: %v", ranges)
+			case "stripped":
+				if len(offsets) != 2 || offsets[0] != 0 || offsets[1] != cutoff {
+					t.Fatalf("stripped range did not resume at the last delivered byte: %v", offsets)
+				}
+			case "dropped":
+				if len(offsets) < 5 {
+					t.Fatalf("only %d responses crossed the proxy cutoff", len(offsets))
+				}
+				for i, offset := range offsets {
+					if offset != int64(i)*cutoff {
+						t.Fatalf("restore resumed at %v, want consecutive delivered offsets", offsets)
+					}
+				}
 			}
 		})
 	}
