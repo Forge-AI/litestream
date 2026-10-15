@@ -63,17 +63,17 @@ func NewReplicateCommand() *ReplicateCommand {
 	}
 }
 
-func (m *Main) runReplicate(ctx context.Context, args []string) error {
+func (m *Main) runReplicate(ctx, parent context.Context, args []string) error {
 	c := NewReplicateCommand()
 	if err := c.ParseFlags(ctx, args); err != nil {
 		return err
 	}
 	signals := signalChan()
 	defer signal.Stop(signals)
-	return c.runUntilStopped(ctx, signals)
+	return c.runUntilStopped(ctx, signals, parent.Done())
 }
 
-func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal) error {
+func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal, parentDone <-chan struct{}) error {
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
 	ready := make(chan struct{})
@@ -95,6 +95,8 @@ func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan o
 				} else {
 					slog.Info("replication complete, litestream shutting down")
 				}
+			case <-parentDone:
+				slog.Info("parent process exited, litestream shutting down")
 			case sig = <-signals:
 			case <-ctx.Done():
 				result, sig = ctx.Err(), os.Interrupt
