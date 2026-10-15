@@ -433,11 +433,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait)
 	if err != nil {
+		var waitErr *ExecutorWaitError
 		switch {
 		case errors.Is(err, ErrDatabaseNotFound):
 			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotOpen):
 			writeJSONError(w, http.StatusConflict, err.Error(), nil)
+		case errors.As(err, &waitErr):
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), waitErr.Holder)
 		default:
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		}

@@ -335,6 +335,7 @@ type SyncDiagnostic struct {
 	ExecutorWaiterCount int        `json:"executor_waiter_count,omitempty"`
 	ExecutorWaitStarted *time.Time `json:"executor_wait_started_at,omitempty"`
 	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
+	DBSize              int64      `json:"db_size,omitempty"`
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -474,10 +475,16 @@ func (db *DB) Path() string {
 
 // SyncDiagnostic returns the latest sync/checkpoint diagnostic snapshot.
 func (db *DB) SyncDiagnostic() SyncDiagnostic {
+	var dbSize int64
+	if fi, err := os.Stat(db.path); err == nil {
+		dbSize = fi.Size()
+	}
+
 	db.syncDiag.RLock()
 	defer db.syncDiag.RUnlock()
 
 	diag := SyncDiagnostic{
+		DBSize:              dbSize,
 		Path:                db.path,
 		Active:              db.syncDiag.active,
 		Operation:           string(db.syncDiag.operation),
@@ -1357,9 +1364,53 @@ func (db *DB) lockExec(ctx context.Context) error {
 	defer db.finishSyncExecutorWait()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("wait for db sync executor: %w", context.Cause(ctx))
+		waitErr := &ExecutorWaitError{Holder: db.SyncDiagnostic(), Err: context.Cause(ctx)}
+		if !errors.Is(waitErr.Err, context.Canceled) {
+			db.logExecutorWait(waitErr)
+		}
+		return waitErr
 	}
 	return nil
+}
+
+type ExecutorWaitError struct {
+	Holder SyncDiagnostic
+	Err    error
+}
+
+func (e *ExecutorWaitError) Error() string {
+	return fmt.Sprintf("wait for db sync executor: %v", e.Err)
+}
+
+func (e *ExecutorWaitError) Unwrap() error {
+	return e.Err
+}
+
+func (e *ExecutorWaitError) Cause() string {
+	switch {
+	case errors.Is(e.Err, context.DeadlineExceeded):
+		return "executor_deadline"
+	default:
+		return "other"
+	}
+}
+
+func (db *DB) logExecutorWait(err *ExecutorWaitError) {
+	holder := err.Holder
+	db.Logger.Warn("sync executor wait ended",
+		"cause", err.Cause(),
+		"holder_active", holder.Active,
+		"holder_operation", holder.Operation,
+		"holder_phase", holder.Phase,
+		"holder_reason", holder.Reason,
+		"holder_snapshotting", holder.Snapshotting,
+		"holder_elapsed_seconds", holder.ElapsedSeconds,
+		"holder_txid", holder.TXID,
+		"holder_wal_bytes", holder.WALSize,
+		"db_bytes", holder.DBSize,
+		"waiters", holder.ExecutorWaiterCount,
+		"wait_seconds", holder.ExecutorWaitSeconds,
+		"error", err.Err)
 }
 
 // addDurationToCounter records positive durations without allowing a clock
@@ -1868,6 +1919,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 
 	if exec.pos.TXID == 0 {
 		info.offset = WALHeaderSize
+		info.reason = "no local ltx position, snapshotting"
 		return info, nil // first sync
 	}
 
