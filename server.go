@@ -439,6 +439,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotOpen):
 			writeJSONError(w, http.StatusConflict, err.Error(), nil)
+		case errors.Is(err, ErrSnapshotting) && errors.As(err, &waitErr):
+			writeJSONError(w, http.StatusServiceUnavailable, err.Error(), waitErr.Holder)
 		case errors.As(err, &waitErr):
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), waitErr.Holder)
 		default:
