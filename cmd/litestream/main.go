@@ -139,11 +139,16 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		cmd, args = args[0], args[1:]
 	}
 
+	parent, err := exitWithParent(ctx)
+	if err != nil {
+		return err
+	}
+
 	switch cmd {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
 	case "replicate":
-		return m.runReplicate(ctx, args)
+		return m.runReplicate(ctx, parent, args)
 
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
@@ -156,7 +161,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "reset":
 		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
-		return (&RestoreCommand{}).Run(ctx, args)
+		return (&RestoreCommand{}).Run(parent, args)
 	case "status":
 		return (&StatusCommand{}).Run(ctx, args)
 	case "sync":
