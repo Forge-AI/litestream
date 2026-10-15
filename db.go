@@ -314,6 +314,7 @@ type diagState struct {
 	err                 string
 	executorWaiterCount int
 	executorWaitStarted time.Time
+	snapshotStarted     chan struct{}
 }
 
 // SyncDiagnostic reports the latest DB sync/checkpoint activity.
@@ -475,48 +476,58 @@ func (db *DB) Path() string {
 
 // SyncDiagnostic returns the latest sync/checkpoint diagnostic snapshot.
 func (db *DB) SyncDiagnostic() SyncDiagnostic {
-	var dbSize int64
-	if fi, err := os.Stat(db.path); err == nil {
-		dbSize = fi.Size()
-	}
+	dbSize := db.dbFileSize()
 
 	db.syncDiag.RLock()
 	defer db.syncDiag.RUnlock()
 
+	diag := db.syncDiag.diagnostic(db.path)
+	diag.DBSize = dbSize
+	return diag
+}
+
+func (db *DB) dbFileSize() int64 {
+	fi, err := os.Stat(db.path)
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+func (s *diagState) diagnostic(path string) SyncDiagnostic {
 	diag := SyncDiagnostic{
-		DBSize:              dbSize,
-		Path:                db.path,
-		Active:              db.syncDiag.active,
-		Operation:           string(db.syncDiag.operation),
-		Phase:               string(db.syncDiag.phase),
-		TXID:                uint64(db.syncDiag.txID),
-		WALSize:             db.syncDiag.walSize,
-		LastSyncedWALOffset: db.syncDiag.lastSyncedWALOffset,
-		Snapshotting:        db.syncDiag.snapshotting,
-		CheckpointMode:      db.syncDiag.checkpointMode,
-		Reason:              db.syncDiag.reason,
-		Error:               db.syncDiag.err,
-		ExecutorWaiterCount: db.syncDiag.executorWaiterCount,
+		Path:                path,
+		Active:              s.active,
+		Operation:           string(s.operation),
+		Phase:               string(s.phase),
+		TXID:                uint64(s.txID),
+		WALSize:             s.walSize,
+		LastSyncedWALOffset: s.lastSyncedWALOffset,
+		Snapshotting:        s.snapshotting,
+		CheckpointMode:      s.checkpointMode,
+		Reason:              s.reason,
+		Error:               s.err,
+		ExecutorWaiterCount: s.executorWaiterCount,
 	}
-	if !db.syncDiag.executorWaitStarted.IsZero() {
-		startedAt := db.syncDiag.executorWaitStarted
+	if !s.executorWaitStarted.IsZero() {
+		startedAt := s.executorWaitStarted
 		diag.ExecutorWaitStarted = &startedAt
-		diag.ExecutorWaitSeconds = time.Since(db.syncDiag.executorWaitStarted).Seconds()
+		diag.ExecutorWaitSeconds = time.Since(s.executorWaitStarted).Seconds()
 	}
-	if !db.syncDiag.startedAt.IsZero() {
-		startedAt := db.syncDiag.startedAt
+	if !s.startedAt.IsZero() {
+		startedAt := s.startedAt
 		diag.StartedAt = &startedAt
 	}
-	if !db.syncDiag.updatedAt.IsZero() {
-		updatedAt := db.syncDiag.updatedAt
+	if !s.updatedAt.IsZero() {
+		updatedAt := s.updatedAt
 		diag.UpdatedAt = &updatedAt
 	}
-	if !db.syncDiag.startedAt.IsZero() {
-		end := db.syncDiag.updatedAt
-		if db.syncDiag.active || end.IsZero() {
+	if !s.startedAt.IsZero() {
+		end := s.updatedAt
+		if s.active || end.IsZero() {
 			end = time.Now()
 		}
-		diag.ElapsedSeconds = end.Sub(db.syncDiag.startedAt).Seconds()
+		diag.ElapsedSeconds = end.Sub(s.startedAt).Seconds()
 	}
 	return diag
 }
@@ -547,11 +558,30 @@ func (db *DB) setSyncDiagPhase(phase diagPhase, updates ...func(*diagState)) {
 	if !db.syncDiag.active {
 		return
 	}
+	wasSnapshotting := db.syncDiag.snapshotting
 	db.syncDiag.phase = phase
 	db.syncDiag.updatedAt = time.Now()
 	for _, update := range updates {
 		update(&db.syncDiag)
 	}
+	if db.syncDiag.snapshotting && !wasSnapshotting && db.syncDiag.snapshotStarted != nil {
+		close(db.syncDiag.snapshotStarted)
+		db.syncDiag.snapshotStarted = nil
+	}
+}
+
+func (db *DB) snapshotStarts() <-chan struct{} {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.snapshotStarted == nil {
+		db.syncDiag.snapshotStarted = make(chan struct{})
+	}
+	return db.syncDiag.snapshotStarted
+}
+
+func (db *DB) runningSnapshot() (SyncDiagnostic, bool) {
+	holder := db.SyncDiagnostic()
+	return holder, holder.Active && holder.Snapshotting
 }
 
 func (db *DB) finishSyncDiag(err error) {
@@ -806,13 +836,14 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 }
 
 // SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
-// replica. Blocks until both stages complete.
+// replica. Blocks until both stages complete, except that it returns
+// ErrSnapshotting instead of queueing behind a full snapshot.
 func (db *DB) SyncAndWait(ctx context.Context) error {
 	if db.Replica == nil {
 		return fmt.Errorf("no replica configured")
 	}
 
-	if err := db.Sync(ctx); err != nil {
+	if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting); err != nil {
 		return fmt.Errorf("db sync: %w", err)
 	}
 	if err := db.Replica.Sync(ctx); err != nil {
@@ -1333,12 +1364,16 @@ func (db *DB) releaseReadLock() error {
 
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) error {
+	return db.syncWith(ctx, db.lockExec)
+}
+
+func (db *DB) syncWith(ctx context.Context, lock func(context.Context) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return context.Cause(ctx)
 		}
 
-		result, err := db.syncOnce(ctx, db.MaxSyncWALBytes)
+		result, err := db.syncOnceWith(ctx, db.MaxSyncWALBytes, lock)
 		if err != nil {
 			return err
 		} else if !result.synced || !result.limited || result.syncedToWALEnd {
@@ -1348,7 +1383,11 @@ func (db *DB) Sync(ctx context.Context) error {
 }
 
 func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, error) {
-	if err := db.lockExec(ctx); err != nil {
+	return db.syncOnceWith(ctx, maxSyncWALBytes, db.lockExec)
+}
+
+func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func(context.Context) error) (syncResult, error) {
+	if err := lock(ctx); err != nil {
 		return syncResult{}, err
 	}
 	defer db.execSem.Release(1)
@@ -1357,6 +1396,14 @@ func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, 
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
+	if err := db.waitExec(ctx); err != nil {
+		db.logExecutorWait(err)
+		return err
+	}
+	return nil
+}
+
+func (db *DB) waitExec(ctx context.Context) *ExecutorWaitError {
 	if db.execSem.TryAcquire(1) {
 		return nil
 	}
@@ -1364,14 +1411,63 @@ func (db *DB) lockExec(ctx context.Context) error {
 	defer db.finishSyncExecutorWait()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		waitErr := &ExecutorWaitError{Holder: db.SyncDiagnostic(), Err: context.Cause(ctx)}
-		if !errors.Is(waitErr.Err, context.Canceled) {
-			db.logExecutorWait(waitErr)
-		}
-		return waitErr
+		return &ExecutorWaitError{Holder: db.SyncDiagnostic(), Err: context.Cause(ctx)}
 	}
 	return nil
 }
+
+func (db *DB) lockExecUnlessSnapshotting(ctx context.Context) error {
+	starts := db.snapshotStarts()
+	if _, running := db.runningSnapshot(); running {
+		started := make(chan struct{})
+		close(started)
+		starts = started
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	var refusal SyncDiagnostic
+	go func() {
+		for {
+			select {
+			case <-starts:
+			case <-ctx.Done():
+				return
+			}
+			starts = db.snapshotStarts()
+			select {
+			case <-time.After(snapshotYieldAfter):
+			case <-ctx.Done():
+				return
+			}
+			holder, running := db.runningSnapshot()
+			select {
+			case <-starts:
+				continue
+			default:
+			}
+			if running {
+				refusal = holder
+				cancel(ErrSnapshotting)
+				return
+			}
+		}
+	}()
+
+	err := db.waitExec(ctx)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err.Err, ErrSnapshotting) {
+		err.Holder = refusal
+	}
+	db.logExecutorWait(err)
+	return err
+}
+
+const snapshotYieldAfter = time.Second
+
+var ErrSnapshotting = errors.New("a full snapshot holds the db sync executor")
 
 type ExecutorWaitError struct {
 	Holder SyncDiagnostic
@@ -1388,6 +1484,8 @@ func (e *ExecutorWaitError) Unwrap() error {
 
 func (e *ExecutorWaitError) Cause() string {
 	switch {
+	case errors.Is(e.Err, ErrSnapshotting):
+		return "snapshotting"
 	case errors.Is(e.Err, context.DeadlineExceeded):
 		return "executor_deadline"
 	default:
@@ -1396,6 +1494,9 @@ func (e *ExecutorWaitError) Cause() string {
 }
 
 func (db *DB) logExecutorWait(err *ExecutorWaitError) {
+	if errors.Is(err.Err, context.Canceled) {
+		return
+	}
 	holder := err.Holder
 	db.Logger.Warn("sync executor wait ended",
 		"cause", err.Cause(),
