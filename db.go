@@ -1974,7 +1974,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	replicaInfo, err := db.Replica.maxRestorableLTXFileInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get replica position: %w", err)
-	} else if replicaInfo.MaxTXID == 0 {
+	}
+	if claimed := db.handover.txid; claimed != 0 && dbPos.TXID == 0 {
+		if continued, err := db.continueStoreHandover(ctx, claimed, replicaInfo.MaxTXID); err != nil || continued {
+			return err
+		}
+	}
+	if replicaInfo.MaxTXID == 0 {
 		return nil // No remote replica data yet
 	}
 
@@ -2060,6 +2066,95 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		"max_txid", maxTXID)
 
 	return nil
+}
+
+const (
+	storeHandoverMsg       = "store handover"
+	storeHandoverContinued = "continued"
+	storeHandoverError     = "error"
+)
+
+func (db *DB) continueStoreHandover(ctx context.Context, claimed, restorable ltx.TXID) (bool, error) {
+	started := time.Now()
+	head, outcome, err := db.seedStoreHead(ctx, claimed, restorable)
+	attrs := []any{
+		"outcome", outcome,
+		"handover_txid", claimed.String(),
+		"store_txid", head.String(),
+		"restorable_txid", restorable.String(),
+		"elapsed_ms", time.Since(started).Milliseconds(),
+	}
+	switch outcome {
+	case storeHandoverContinued:
+		db.invalidatePosCache()
+		db.Replica.SetPos(ltx.Pos{TXID: claimed})
+		db.Logger.Warn(storeHandoverMsg, attrs...)
+		return true, nil
+	case storeHandoverError:
+		db.Logger.Error(storeHandoverMsg, append(attrs, "error", err.Error())...)
+		return false, err
+	default:
+		db.handover = handoverClaim{proof: &HandoverProof{TXID: uint64(head)}}
+		db.Logger.Warn(storeHandoverMsg, attrs...)
+		return false, nil
+	}
+}
+
+func (db *DB) seedStoreHead(ctx context.Context, claimed, restorable ltx.TXID) (ltx.TXID, string, error) {
+	head, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return 0, storeHandoverError, fmt.Errorf("get replica L0 head: %w", err)
+	}
+	switch {
+	case head.MaxTXID != claimed:
+		return head.MaxTXID, "head_differs", nil
+	case restorable > claimed:
+		return head.MaxTXID, "restorable_above", nil
+	}
+	if err := internal.MkdirAll(db.LTXLevelDir(0), db.dirInfo); err != nil {
+		return head.MaxTXID, storeHandoverError, fmt.Errorf("create L0 directory: %w", err)
+	}
+	localPath := db.LTXPath(0, head.MinTXID, head.MaxTXID)
+	tmpPath := localPath + ".tmp"
+	defer func() { _ = os.Remove(tmpPath) }()
+	positioned, err := db.copyStoreHead(ctx, head, tmpPath)
+	if err != nil {
+		return head.MaxTXID, storeHandoverError, err
+	}
+	if !positioned {
+		return head.MaxTXID, "no_wal_position", nil
+	}
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return head.MaxTXID, storeHandoverError, fmt.Errorf("rename L0 file: %w", err)
+	}
+	return head.MaxTXID, storeHandoverContinued, nil
+}
+
+func (db *DB) copyStoreHead(ctx context.Context, head ltx.FileInfo, tmpPath string) (bool, error) {
+	remote, err := db.Replica.Client.OpenLTXFile(ctx, 0, head.MinTXID, head.MaxTXID, 0, 0)
+	if err != nil {
+		return false, fmt.Errorf("open the store's L0 head: %w", err)
+	}
+	defer func() { _ = remote.Close() }()
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return false, fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	if _, err := io.Copy(f, remote); err != nil {
+		return false, fmt.Errorf("copy the store's L0 head: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return false, fmt.Errorf("sync L0 file: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return false, fmt.Errorf("rewind L0 file: %w", err)
+	}
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		return false, fmt.Errorf("decode the store's L0 head: %w", err)
+	}
+	return dec.Header().WALOffset >= WALHeaderSize, f.Close()
 }
 
 // rebaseLTX re-encodes an LTX file under a later MinTXID. Applying a file's
