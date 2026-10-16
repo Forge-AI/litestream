@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	"customeredge"
+
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
@@ -123,6 +125,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Configure client options with retry policy
 	clientOptions := &azblob.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
+			Transport: customeredge.Client{HTTP: http.DefaultClient, Name: "litestream_abs"},
 			Retry: policy.RetryOptions{
 				MaxRetries:    10,
 				RetryDelay:    time.Second,
