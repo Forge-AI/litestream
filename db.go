@@ -283,6 +283,12 @@ func (db *DB) SetHandover(txid ltx.TXID) {
 	db.handover = handoverClaim{txid: txid}
 }
 
+func (db *DB) HandoverClaimed() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.handover.txid != 0 || db.handover.proof != nil
+}
+
 // ProveHandover runs the first sync executor's check of the claim
 // SetHandover recorded and returns its verdict.
 func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
