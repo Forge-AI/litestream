@@ -1392,7 +1392,20 @@ func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func
 	}
 	defer db.execSem.Release(1)
 
-	return db.syncLocked(ctx, maxSyncWALBytes)
+	db.mu.RLock()
+	lifetime := db.ctx
+	db.mu.RUnlock()
+
+	started := time.Now()
+	result, err := db.syncLocked(lifetime, maxSyncWALBytes)
+	if ctx.Err() != nil {
+		db.Logger.Warn("a sync outlived its caller; finished it so a checkpoint never stops halfway",
+			"cause", context.Cause(ctx),
+			"elapsed_seconds", time.Since(started).Seconds(),
+			"synced", result.synced,
+			"error", err)
+	}
+	return result, err
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
