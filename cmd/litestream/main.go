@@ -18,6 +18,8 @@ import (
 	"strings"
 	"time"
 
+	"customeredge"
+
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
@@ -82,6 +84,19 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
+	shutdown, err := customeredge.StartMetrics(context.Background(), "litestream")
+	if err != nil {
+		slog.Error("customer edge metrics failed", "stage", "customer_edge_metrics", "cause", "export", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			slog.Warn("customer edge metric shutdown failed", "stage", "customer_edge_metrics", "cause", "export", "err", err)
+		}
+	}()
+
 	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
