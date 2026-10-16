@@ -1,17 +1,23 @@
 package litestream
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/superfly/ltx"
 )
 
 func holdExecutor(t *testing.T, db *DB) {
@@ -273,5 +279,75 @@ func TestServer_SyncTimeoutCarriesTheExecutorHolder(t *testing.T) {
 	}
 	if details.Phase != "verify" || details.Snapshotting || details.Path != db.Path() || details.DBSize == 0 {
 		t.Fatalf("details=%+v, want the verifying holder of %s with its size", details, db.Path())
+	}
+}
+
+func TestDB_SyncAndWaitFinishesACheckpointItsCallerAbandons(t *testing.T) {
+	db := openReplicatedDB(t)
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+	before, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancelCause(t.Context())
+	defer cancel(nil)
+	restarted := make(chan struct{})
+	var once sync.Once
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if hdr, err := readWALHeader(db.WALPath()); err == nil && !bytes.Equal(hdr, before) {
+			once.Do(func() { close(restarted) })
+			<-ctx.Done()
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+	db.MinCheckpointPageN = 1
+
+	done := make(chan error, 1)
+	go func() { done <- db.SyncAndWait(ctx) }()
+	select {
+	case <-restarted:
+	case err := <-done:
+		t.Fatalf("returned before the checkpoint restarted the wal: %v", err)
+	}
+	cancel(context.DeadlineExceeded)
+	<-done
+
+	after, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.openLTXFile = defaultOpenLTXFile
+	db.MinCheckpointPageN = DefaultMinCheckpointPageN
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	f, err := os.Open(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	hdr := dec.Header()
+	if hdr.WALOffset != WALHeaderSize || hdr.WALSalt1 != binary.BigEndian.Uint32(after[16:]) || hdr.WALSalt2 != binary.BigEndian.Uint32(after[20:]) {
+		t.Fatalf("last ltx %+v, want the copy of the restarted wal the abandoned checkpoint began", hdr)
 	}
 }
