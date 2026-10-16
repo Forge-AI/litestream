@@ -12,6 +12,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/superfly/ltx"
 )
 
 // SocketConfig configures the Unix socket for control commands.
@@ -197,12 +199,23 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := "started"
+	var handover *HandoverProof
 	if db.IsOpen() {
 		status = "already_running"
 	} else {
+		db.SetHandover(ltx.TXID(req.HandoverTXID))
 		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
+			db.SetHandover(0)
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 			return
+		}
+		if req.HandoverTXID != 0 {
+			proof, err := db.ProveHandover(ctx)
+			if err != nil {
+				writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+				return
+			}
+			handover = &proof
 		}
 	}
 	txID, err := s.storeTXID(expandedPath)
@@ -212,9 +225,10 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, StartResponse{
-		Status: status,
-		Path:   expandedPath,
-		TXID:   txID,
+		Status:   status,
+		Path:     expandedPath,
+		TXID:     txID,
+		Handover: handover,
 	})
 }
 
@@ -360,15 +374,17 @@ func writeJSONError(w http.ResponseWriter, status int, message string, details i
 
 // StartRequest is the request body for the /start endpoint.
 type StartRequest struct {
-	Path    string `json:"path"`
-	Timeout int    `json:"timeout,omitempty"`
+	Path         string `json:"path"`
+	Timeout      int    `json:"timeout,omitempty"`
+	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 }
 
 // StartResponse is the response body for the /start endpoint.
 type StartResponse struct {
-	Status string `json:"status"`
-	Path   string `json:"path"`
-	TXID   uint64 `json:"txid"`
+	Status   string         `json:"status"`
+	Path     string         `json:"path"`
+	TXID     uint64         `json:"txid"`
+	Handover *HandoverProof `json:"handover,omitempty"`
 }
 
 // StopRequest is the request body for the /stop endpoint.
@@ -553,14 +569,16 @@ type InfoResponse struct {
 
 // RegisterDatabaseRequest is the request body for the /register endpoint.
 type RegisterDatabaseRequest struct {
-	Path       string `json:"path"`
-	ReplicaURL string `json:"replica_url"`
+	Path         string `json:"path"`
+	ReplicaURL   string `json:"replica_url"`
+	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
 type RegisterDatabaseResponse struct {
-	Status string `json:"status"`
-	Path   string `json:"path"`
+	Status   string         `json:"status"`
+	Path     string         `json:"path"`
+	Handover *HandoverProof `json:"handover,omitempty"`
 }
 
 // UnregisterDatabaseRequest is the request body for the /unregister endpoint.
@@ -617,6 +635,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create new database.
 	db := NewDB(expandedPath)
+	if req.HandoverTXID != 0 {
+		db.SetHandover(ltx.TXID(req.HandoverTXID))
+	}
 
 	// Create replica and attach client.
 	replica := NewReplica(db)
@@ -629,9 +650,20 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var handover *HandoverProof
+	if req.HandoverTXID != 0 {
+		proof, err := db.ProveHandover(s.ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to prove hand-over: %v", err), nil)
+			return
+		}
+		handover = &proof
+	}
+
 	writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
-		Status: "registered",
-		Path:   expandedPath,
+		Status:   "registered",
+		Path:     expandedPath,
+		Handover: handover,
 	})
 }
 
