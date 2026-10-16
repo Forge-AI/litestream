@@ -261,3 +261,132 @@ func TestDB_HandoverTXIDBehindTheReplicaSnapshots(t *testing.T) {
 	}
 	requireRestoreMatches(t, ctx, h)
 }
+
+func handOverAcrossNodes(t *testing.T, ctx context.Context, behind ltx.TXID) handedOver {
+	t.Helper()
+	dir := t.TempDir()
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	source := filepath.Join(dir, "node-1", "db")
+	if err := os.MkdirAll(filepath.Dir(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	before := openHandoverPublisher(t, source, client)
+	sqldb := openServerSQLDB(t, ctx, source)
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	for first := 1; first <= handoverRows; first += handoverRows / 2 {
+		insertHandoverRows(t, ctx, sqldb, first, handoverRows/2)
+		if err := before.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := before.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := before.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := before.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+
+	copied := filepath.Join(dir, "node-2", "db")
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = copied
+	if err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, opt); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := litestream.ReadTXIDFile(copied)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != pos.TXID {
+		t.Fatalf("the restored copy records txid %s, want the store head %s", restored, pos.TXID)
+	}
+	sqldb = openServerSQLDB(t, ctx, copied)
+	t.Cleanup(func() { _ = sqldb.Close() })
+	insertHandoverRows(t, ctx, sqldb, handoverRows+1, 4)
+
+	return handedOver{
+		db:     openHandoverPublisherClaiming(t, copied, client, restored-behind),
+		client: client,
+		sqldb:  sqldb,
+		txid:   pos.TXID,
+	}
+}
+
+func proveLogged(t *testing.T, ctx context.Context, h handedOver) (litestream.HandoverProof, []string) {
+	t.Helper()
+	var lane bytes.Buffer
+	h.db.Logger = slog.New(slog.NewJSONHandler(&lane, nil))
+	proof, err := h.db.ProveHandover(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var outcomes []string
+	lines := bufio.NewScanner(&lane)
+	for lines.Scan() {
+		var record struct {
+			Msg     string `json:"msg"`
+			Outcome string `json:"outcome"`
+		}
+		if err := json.Unmarshal(lines.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Msg == "store handover" {
+			outcomes = append(outcomes, record.Outcome)
+		}
+	}
+	if err := lines.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return proof, outcomes
+}
+
+func TestDB_HandoverTXIDOnAnEmptyChainContinuesTheStoreHead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h := handOverAcrossNodes(t, ctx, 0)
+
+	proof, outcomes := proveLogged(t, ctx, h)
+	if !proof.Continued || proof.TXID != uint64(h.txid) {
+		t.Fatalf("a copy declaring the store's level-0 head %s must continue it: %+v", h.txid, proof)
+	}
+	if len(outcomes) != 1 || outcomes[0] != "continued" {
+		t.Fatalf("the lane must log one continued store hand-over, got %q", outcomes)
+	}
+	pages, commit, snapshots := shipFirstSync(t, ctx, h)
+	if pages >= int(commit) {
+		t.Fatalf("the first sync after a cross-node hand-over shipped %d of %d pages, a full snapshot", pages, commit)
+	}
+	if len(snapshots) != 0 {
+		t.Fatalf("a continued cross-node hand-over logged lane snapshots %q", snapshots)
+	}
+	requireRestoreMatches(t, ctx, h)
+}
+
+func TestDB_HandoverTXIDOnAnEmptyChainBehindTheStoreHeadSnapshots(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h := handOverAcrossNodes(t, ctx, 1)
+
+	proof, outcomes := proveLogged(t, ctx, h)
+	if proof.Continued || proof.TXID != uint64(h.txid) {
+		t.Fatalf("a copy declaring a txid behind the store's level-0 head %s must not continue: %+v", h.txid, proof)
+	}
+	if len(outcomes) != 1 || outcomes[0] != "head_differs" {
+		t.Fatalf("the lane must log the refused store hand-over with its cause, got %q", outcomes)
+	}
+	pages, commit, snapshots := shipFirstSync(t, ctx, h)
+	if pages != int(commit) {
+		t.Fatalf("a refused cross-node claim must snapshot; the first sync shipped %d of %d pages", pages, commit)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("a refused cross-node claim must log one lane snapshot with its reason, got %q", snapshots)
+	}
+	requireRestoreMatches(t, ctx, h)
+}
