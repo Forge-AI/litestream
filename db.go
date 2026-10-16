@@ -79,6 +79,7 @@ type DB struct {
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+	handover  handoverClaim
 
 	lastLTXPage *verifiedLTXPage
 
@@ -252,6 +253,60 @@ type syncState struct {
 	// a checkpoint. This prevents issue #997 where PASSIVE checkpoints
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
+
+	// handoverTXID is a position the server proved this database file holds
+	// with nothing folded in since, so a WAL that no longer continues the
+	// last LTX file resumes from its header instead of snapshotting.
+	handoverTXID ltx.TXID
+}
+
+type handoverClaim struct {
+	txid  ltx.TXID
+	proof *HandoverProof
+}
+
+// HandoverProof answers whether a hand-over's transaction ID is this
+// database's replicated position, which lets the next sync resume the WAL
+// the server truncated instead of snapshotting.
+type HandoverProof struct {
+	Continued bool   `json:"continued"`
+	TXID      uint64 `json:"txid"`
+}
+
+// SetHandover records the transaction ID a server's hand-over says the
+// database's replica ends at. The server vouches that the database file
+// holds exactly that state and that every write since sits in the current
+// WAL. Call before Open; the first sync executor checks it.
+func (db *DB) SetHandover(txid ltx.TXID) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.handover = handoverClaim{txid: txid}
+}
+
+// ProveHandover runs the first sync executor's check of the claim
+// SetHandover recorded and returns its verdict.
+func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
+	if err := db.lockExec(ctx); err != nil {
+		return HandoverProof{}, err
+	}
+	defer db.execSem.Release(1)
+
+	exec, err := db.newSyncExecutor(ctx)
+	if err == nil && exec == nil {
+		err = fmt.Errorf("prove hand-over: database file missing: %s", db.path)
+	}
+	if err != nil {
+		db.SetHandover(0)
+		return HandoverProof{}, err
+	}
+	db.applySyncExecutor(exec, false)
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.handover.proof == nil {
+		return HandoverProof{}, fmt.Errorf("prove hand-over: no hand-over claimed for %s", db.path)
+	}
+	return *db.handover.proof, nil
 }
 
 type syncExecutor struct {
@@ -664,6 +719,11 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 
 	db.invalidatePosCache()
 
+	db.mu.Lock()
+	db.syncState.handoverTXID = 0
+	db.handover = handoverClaim{}
+	db.mu.Unlock()
+
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
 }
@@ -989,6 +1049,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.f = nil
 	db.opened = false
 	db.rtx = nil
+	db.syncState.handoverTXID = 0
+	db.handover = handoverClaim{}
 	db.mu.Unlock()
 
 	if sqlDB != nil {
@@ -2053,7 +2115,33 @@ func (db *DB) verify(ctx context.Context, state *syncState) (info syncInfo, err 
 	})
 }
 
-func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info syncInfo, err error) {
+func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncInfo, error) {
+	info, err := db.verifyWAL(ctx, exec)
+	if err != nil || !info.snapshotting || exec.state.handoverTXID == 0 {
+		return info, err
+	}
+	if exec.pos.TXID != exec.state.handoverTXID {
+		exec.state.handoverTXID = 0
+		return info, nil
+	}
+
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return info, fmt.Errorf("read wal header after hand-over: %w", err)
+	}
+	db.Logger.Info("resuming the handed-over wal from its header",
+		"txid", exec.pos.TXID.String(),
+		"instead_of", info.reason)
+	return syncInfo{
+		offset:              WALHeaderSize,
+		salt1:               binary.BigEndian.Uint32(hdr[16:]),
+		salt2:               binary.BigEndian.Uint32(hdr[20:]),
+		prevCommit:          info.prevCommit,
+		clearSyncedToWALEnd: true,
+	}, nil
+}
+
+func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo, err error) {
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
@@ -2306,6 +2394,7 @@ func (db *DB) applySyncResult(state *syncState, result syncResult) {
 	state.lastSyncedWALOffset = result.newWALSize
 	state.syncedToWALEnd = result.syncedToWALEnd
 	if result.pos != nil {
+		state.handoverTXID = 0
 		db.pos.Lock()
 		db.pos.value = result.pos
 		db.pos.Unlock()
@@ -2330,6 +2419,19 @@ func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
 	pos, err := db.Pos()
 	if err != nil {
 		return nil, fmt.Errorf("pos: %w", err)
+	}
+
+	if claimed := db.handover.txid; claimed != 0 {
+		proof := HandoverProof{Continued: pos.TXID == claimed, TXID: uint64(pos.TXID)}
+		if proof.Continued {
+			db.syncState.handoverTXID = claimed
+			db.Logger.Info("hand-over position proven", "txid", claimed.String())
+		} else {
+			db.Logger.Warn("hand-over position differs from the replicated position; the next sync snapshots",
+				"handover_txid", claimed.String(),
+				"txid", pos.TXID.String())
+		}
+		db.handover = handoverClaim{proof: &proof}
 	}
 
 	return &syncExecutor{
@@ -2375,6 +2477,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 	if result.pos != nil {
 		exec.pos = *result.pos
 		exec.posChanged = true
+		exec.state.handoverTXID = 0
 	}
 	if result.l0FileInfo != nil {
 		info := *result.l0FileInfo
