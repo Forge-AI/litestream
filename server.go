@@ -199,7 +199,6 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	status := "started"
-	var handover *HandoverProof
 	if db.IsOpen() {
 		status = "already_running"
 	} else {
@@ -209,14 +208,15 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 			return
 		}
-		if req.HandoverTXID != 0 {
-			proof, err := db.ProveHandover(ctx)
-			if err != nil {
-				writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
-				return
-			}
-			handover = &proof
+	}
+	var handover *HandoverProof
+	if req.HandoverTXID != 0 && db.HandoverClaimed() {
+		proof, err := db.ProveHandover(ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+			return
 		}
+		handover = &proof
 	}
 	txID, err := s.storeTXID(expandedPath)
 	if err != nil {
