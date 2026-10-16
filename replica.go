@@ -827,12 +827,13 @@ func (r *Replica) restore(ctx context.Context, opt RestoreOptions, restoredTXID 
 		r.Logger().Info("post-restore integrity check passed")
 	}
 
+	maxTXID := infos[len(infos)-1].MaxTXID
+	if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
+		return fmt.Errorf("write initial txid file: %w", err)
+	}
+
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		maxTXID := infos[len(infos)-1].MaxTXID
-		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
-			return fmt.Errorf("write initial txid file: %w", err)
-		}
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
 	}
 
