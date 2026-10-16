@@ -155,6 +155,11 @@ func (c *ReplicateCommand) shutdown(ctx context.Context, sig os.Signal) error {
 			result = fmt.Errorf("cannot wait for exec process: %w", err)
 		}
 	}
+	if sig != nil {
+		c.Abandon()
+		slog.Info("litestream abandoned replication without a final sync")
+		return result
+	}
 	return errors.Join(result, c.Close(ctx))
 }
 
@@ -552,6 +557,17 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+// Abandon stops replication without closing a database: no final sync and no
+// close-time checkpoint, so the next process resumes from the kept WAL.
+func (c *ReplicateCommand) Abandon() {
+	if c.Store == nil {
+		return
+	}
+	for _, db := range c.Store.DBs() {
+		db.Abandon()
+	}
 }
 
 // SetDone sets the done channel used for interrupt handling during shutdown.

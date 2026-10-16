@@ -75,6 +75,7 @@ type DB struct {
 	pageSize  int           // page size, in bytes
 	notify    chan struct{} // closes on WAL change
 	chkMu     sync.RWMutex  // checkpoint lock
+	boundary  sync.Mutex    // held across a checkpoint and its boundary sync; Abandon keeps it
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
@@ -1007,6 +1008,31 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.deleteMetrics()
 
 	return err
+}
+
+// Abandon waits out an in-flight checkpoint and bars every later one, then
+// logs the position the next process resumes from. It neither syncs nor
+// closes, so the WAL tail no replica holds stays on disk for that process.
+func (db *DB) Abandon() {
+	db.boundary.Lock()
+	pos, err := db.Pos()
+	if err != nil {
+		db.Logger.Error("abandoned without a readable position", "error", err)
+		return
+	}
+	var replicated ltx.Pos
+	if db.Replica != nil {
+		replicated = db.Replica.Pos()
+	}
+	unsynced := pos.TXID > replicated.TXID
+	level := slog.LevelInfo
+	if unsynced {
+		level = slog.LevelWarn
+	}
+	db.Logger.Log(context.Background(), level, "abandoned without a final sync",
+		"txid", uint64(pos.TXID),
+		"replicated_txid", uint64(replicated.TXID),
+		"unsynced", unsynced)
 }
 
 // syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
@@ -2843,6 +2869,8 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		return false, nil
 	}
 	defer db.chkMu.Unlock()
+	db.boundary.Lock()
+	defer db.boundary.Unlock()
 	exec.checkpointAttempted = true
 
 	// Read WAL header before checkpoint to check if it has been restarted.
