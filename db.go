@@ -1743,6 +1743,9 @@ func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool,
 	if err != nil {
 		return syncResult{}, fmt.Errorf("cannot verify wal state: %w", err)
 	}
+	if info.snapshotting {
+		db.Logger.Warn("lane snapshot", "reason", info.reason, "txid", uint64(exec.pos.TXID+1))
+	}
 
 	db.setSyncDiagPhase(diagPhaseSyncLTX, func(s *diagState) {
 		s.txID = exec.pos.TXID + 1
