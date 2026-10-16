@@ -1,10 +1,14 @@
 package litestream_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,8 +118,10 @@ func insertHandoverRows(t *testing.T, ctx context.Context, sqldb *sql.DB, first,
 	}
 }
 
-func shipFirstSync(t *testing.T, ctx context.Context, h handedOver) (pages int, commit uint32) {
+func shipFirstSync(t *testing.T, ctx context.Context, h handedOver) (pages int, commit uint32, snapshots []string) {
 	t.Helper()
+	var lane bytes.Buffer
+	h.db.Logger = slog.New(slog.NewJSONHandler(&lane, nil))
 	if err := h.db.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +148,34 @@ func shipFirstSync(t *testing.T, ctx context.Context, h handedOver) (pages int, 
 		}
 		pages++
 	}
-	return pages, dec.Header().Commit
+	return pages, dec.Header().Commit, snapshotReasons(t, &lane)
+}
+
+func snapshotReasons(t *testing.T, lane *bytes.Buffer) []string {
+	t.Helper()
+	var reasons []string
+	lines := bufio.NewScanner(lane)
+	for lines.Scan() {
+		var record struct {
+			Level  string `json:"level"`
+			Msg    string `json:"msg"`
+			Reason string `json:"reason"`
+		}
+		if err := json.Unmarshal(lines.Bytes(), &record); err != nil {
+			t.Fatal(err)
+		}
+		if record.Msg != "lane snapshot" {
+			continue
+		}
+		if record.Level != slog.LevelWarn.String() || record.Reason == "" {
+			t.Fatalf("a lane snapshot must warn with its reason: %s", lines.Bytes())
+		}
+		reasons = append(reasons, record.Reason)
+	}
+	if err := lines.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return reasons
 }
 
 func requireRestoreMatches(t *testing.T, ctx context.Context, h handedOver) {
@@ -195,9 +228,12 @@ func TestDB_HandoverTXIDResumesTheTruncatedWAL(t *testing.T) {
 			if !proof.Continued || proof.TXID != uint64(h.txid) {
 				t.Fatalf("a claim at the replicated position %s must continue: %+v", h.txid, proof)
 			}
-			pages, commit := shipFirstSync(t, ctx, h)
+			pages, commit, snapshots := shipFirstSync(t, ctx, h)
 			if pages >= int(commit) {
 				t.Fatalf("the first sync after the hand-over shipped %d of %d pages, a full snapshot", pages, commit)
+			}
+			if len(snapshots) != 0 {
+				t.Fatalf("a continued hand-over logged lane snapshots %q", snapshots)
 			}
 			requireRestoreMatches(t, ctx, h)
 		})
@@ -216,9 +252,12 @@ func TestDB_HandoverTXIDBehindTheReplicaSnapshots(t *testing.T) {
 	if proof.Continued || proof.TXID != uint64(h.txid) {
 		t.Fatalf("a claim behind the replicated position %s must not continue: %+v", h.txid, proof)
 	}
-	pages, commit := shipFirstSync(t, ctx, h)
+	pages, commit, snapshots := shipFirstSync(t, ctx, h)
 	if pages != int(commit) {
 		t.Fatalf("a refused claim must snapshot; the first sync shipped %d of %d pages", pages, commit)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("a refused claim must log one lane snapshot with its reason, got %q", snapshots)
 	}
 	requireRestoreMatches(t, ctx, h)
 }
