@@ -427,6 +427,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "path required", nil)
 		return
 	}
+	if req.Wait && req.Checkpoint {
+		writeJSONError(w, http.StatusBadRequest, "wait and checkpoint are exclusive", nil)
+		return
+	}
 
 	expandedPath, err := s.expandPath(req.Path)
 	if err != nil {
@@ -447,7 +451,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait)
+	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
 		var waitErr *ExecutorWaitError
 		switch {
@@ -484,9 +488,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 // SyncRequest is the request body for the /sync endpoint.
 type SyncRequest struct {
-	Path    string `json:"path"`
-	Wait    bool   `json:"wait,omitempty"`
-	Timeout int    `json:"timeout,omitempty"`
+	Path       string `json:"path"`
+	Wait       bool   `json:"wait,omitempty"`
+	Checkpoint bool   `json:"checkpoint,omitempty"`
+	Timeout    int    `json:"timeout,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.
@@ -569,9 +574,10 @@ type InfoResponse struct {
 
 // RegisterDatabaseRequest is the request body for the /register endpoint.
 type RegisterDatabaseRequest struct {
-	Path         string `json:"path"`
-	ReplicaURL   string `json:"replica_url"`
-	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	Path                 string `json:"path"`
+	ReplicaURL           string `json:"replica_url"`
+	HandoverTXID         uint64 `json:"handover_txid,omitempty"`
+	CheckpointIntervalMS int64  `json:"checkpoint_interval_ms,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -637,6 +643,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	db := NewDB(expandedPath)
 	if req.HandoverTXID != 0 {
 		db.SetHandover(ltx.TXID(req.HandoverTXID))
+	}
+	if req.CheckpointIntervalMS != 0 {
+		db.CheckpointInterval = time.Duration(req.CheckpointIntervalMS) * time.Millisecond
 	}
 
 	// Create replica and attach client.
