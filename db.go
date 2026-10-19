@@ -3010,6 +3010,23 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 		return err
 	}
 	defer db.execSem.Release(1)
+	return db.checkpointLocked(ctx, mode)
+}
+
+func (db *DB) CheckpointOutlivingCaller(ctx context.Context, mode string) error {
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
+	defer db.execSem.Release(1)
+
+	db.mu.RLock()
+	lifetime := db.ctx
+	db.mu.RUnlock()
+
+	return db.checkpointLocked(lifetime, mode)
+}
+
+func (db *DB) checkpointLocked(ctx context.Context, mode string) (err error) {
 	db.beginSyncDiag(diagOpCheckpoint)
 	defer func() { db.finishSyncDiag(err) }()
 
