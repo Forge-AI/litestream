@@ -3,6 +3,7 @@ package gs
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,12 +11,15 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/superfly/ltx"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -41,8 +45,9 @@ type ReplicaClient struct {
 	logger *slog.Logger
 
 	// GS bucket information
-	Bucket string
-	Path   string
+	Bucket   string
+	Path     string
+	Endpoint string
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -66,6 +71,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client := NewReplicaClient()
 	client.Bucket = host
 	client.Path = urlPath
+	client.Endpoint = query.Get("endpoint")
 	return client, nil
 }
 
@@ -83,7 +89,14 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	if c.client, err = storage.NewClient(context.WithoutCancel(ctx)); err != nil {
+	var opts []option.ClientOption
+	if c.Endpoint != "" {
+		opts = append(opts, option.WithEndpoint(strings.TrimSuffix(c.Endpoint, "/")+"/storage/v1/"))
+	}
+	if tokenFile := os.Getenv("LITESTREAM_GCS_TOKEN_FILE"); tokenFile != "" {
+		opts = append(opts, option.WithTokenSource(oauth2.ReuseTokenSource(nil, fileTokenSource(tokenFile))))
+	}
+	if c.client, err = storage.NewClient(context.WithoutCancel(ctx), opts...); err != nil {
 		return fmt.Errorf("failed to create GCS client (bucket: %s): %w", c.Bucket, err)
 	}
 	c.bkt = c.client.Bucket(c.Bucket)
@@ -312,4 +325,21 @@ func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 
 func isNotExists(err error) bool {
 	return errors.Is(err, storage.ErrObjectNotExist)
+}
+
+type fileTokenSource string
+
+func (path fileTokenSource) Token() (*oauth2.Token, error) {
+	raw, err := os.ReadFile(string(path))
+	if err != nil {
+		return nil, fmt.Errorf("read gs token file: %w", err)
+	}
+	var file struct {
+		AccessToken string    `json:"access_token"`
+		Expiration  time.Time `json:"expiration"`
+	}
+	if err := json.Unmarshal(raw, &file); err != nil {
+		return nil, fmt.Errorf("parse gs token file %s: %w", path, err)
+	}
+	return &oauth2.Token{AccessToken: file.AccessToken, TokenType: "Bearer", Expiry: file.Expiration}, nil
 }
