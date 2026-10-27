@@ -189,6 +189,41 @@ func TestReplica_UploadLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 	})
 }
 
+func TestReplica_UploadLTXFile_RaisesCachedL0Max(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	r := NewReplicaWithClient(db, &followTestReplicaClient{
+		WriteLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (*ltx.FileInfo, error) {
+			if _, err := io.Copy(io.Discard, rd); err != nil {
+				return nil, err
+			}
+			return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
+		},
+	})
+	if err := os.MkdirAll(db.LTXLevelDir(0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, txID := range []ltx.TXID{3, 4} {
+		if err := os.WriteFile(db.LTXPath(0, txID, txID), []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := r.uploadLTXFile(context.Background(), 0, 3, 3); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.maxLTXFileInfos.m[0]; ok {
+		t.Fatal("upload cached an L0 position nothing had read")
+	}
+
+	db.maxLTXFileInfos.m[0] = &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2}
+	if err := r.uploadLTXFile(context.Background(), 0, 4, 4); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.maxLTXFileInfos.m[0].MaxTXID; got != 4 {
+		t.Fatalf("cached L0 max=%s, want 4", got)
+	}
+}
+
 func TestReplica_ApplyLTXFile_VerifiesChecksumOnClose(t *testing.T) {
 	const pageSize = 4096
 

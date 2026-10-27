@@ -63,17 +63,17 @@ func NewReplicateCommand() *ReplicateCommand {
 	}
 }
 
-func (m *Main) runReplicate(ctx context.Context, args []string) error {
+func (m *Main) runReplicate(ctx, owner context.Context, args []string) error {
 	c := NewReplicateCommand()
 	if err := c.ParseFlags(ctx, args); err != nil {
 		return err
 	}
 	signals := signalChan()
 	defer signal.Stop(signals)
-	return c.runUntilStopped(ctx, signals)
+	return c.runUntilStopped(ctx, signals, owner.Done())
 }
 
-func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal) error {
+func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal, ownerDone <-chan struct{}) error {
 	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelRun()
 	ready := make(chan struct{})
@@ -95,6 +95,8 @@ func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan o
 				} else {
 					slog.Info("replication complete, litestream shutting down")
 				}
+			case <-ownerDone:
+				slog.Info("owner closed its pipe, litestream shutting down")
 			case sig = <-signals:
 			case <-ctx.Done():
 				result, sig = ctx.Err(), os.Interrupt
@@ -152,6 +154,11 @@ func (c *ReplicateCommand) shutdown(ctx context.Context, sig os.Signal) error {
 		} else if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
 			result = fmt.Errorf("cannot wait for exec process: %w", err)
 		}
+	}
+	if sig != nil {
+		c.Abandon()
+		slog.Info("litestream abandoned replication without a final sync")
+		return result
 	}
 	return errors.Join(result, c.Close(ctx))
 }
@@ -550,6 +557,17 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	return err
+}
+
+// Abandon stops replication without closing a database: no final sync and no
+// close-time checkpoint, so the next process resumes from the kept WAL.
+func (c *ReplicateCommand) Abandon() {
+	if c.Store == nil {
+		return
+	}
+	for _, db := range c.Store.DBs() {
+		db.Abandon()
+	}
 }
 
 // SetDone sets the done channel used for interrupt handling during shutdown.
