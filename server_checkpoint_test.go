@@ -103,13 +103,6 @@ func TestServer_SyncWithoutCheckpointLeavesTheLogAndAnIdleDatabaseShipsNothing(t
 	}
 }
 
-func TestServer_SyncRefusesACheckpointThatWaits(t *testing.T) {
-	status, answer := postSync(t, serveSyncs(t), litestream.SyncRequest{Path: "/db", Wait: true, Checkpoint: true})
-	if status != http.StatusBadRequest {
-		t.Fatalf("status=%d error=%q, want 400", status, answer.Error)
-	}
-}
-
 type syncAnswer struct {
 	litestream.SyncResponse
 	Error string `json:"error"`

@@ -258,8 +258,6 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 		return fmt.Errorf("write ltx file: %w", err)
 	}
 
-	// Raise a cached L0 position that a failed local sync left behind the
-	// replica, so idle compaction still sees the file this upload added.
 	if level == 0 {
 		r.db.maxLTXFileInfos.Lock()
 		if cached, ok := r.db.maxLTXFileInfos.m[0]; ok && cached.MaxTXID < info.MaxTXID {
