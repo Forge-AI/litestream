@@ -15,8 +15,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
-
-	"github.com/benbjohnson/litestream/internal"
 )
 
 var (
@@ -471,11 +469,8 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 
 	switch {
 	case checkpoint:
-		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil {
-			if !isSQLiteBusyError(err) {
-				return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
-			}
-			db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil && !isSQLiteBusyError(err) {
+			return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
 		}
 	case wait:
 		if err := db.SyncAndWait(ctx); err != nil {

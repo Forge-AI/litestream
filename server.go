@@ -427,10 +427,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "path required", nil)
 		return
 	}
-	if req.Wait && req.Checkpoint {
-		writeJSONError(w, http.StatusBadRequest, "wait and checkpoint are exclusive", nil)
-		return
-	}
 
 	expandedPath, err := s.expandPath(req.Path)
 	if err != nil {

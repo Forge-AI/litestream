@@ -266,8 +266,6 @@ func TestStore_CompactDB(t *testing.T) {
 		require.Equal(t, ltx.TXID(3), info.MaxTXID)
 	})
 
-	// A database reopened after another writer replicated to its path must
-	// compact those files even when it writes nothing itself.
 	t.Run("L1AfterReopen", func(t *testing.T) {
 		client := testingutil.NewFileReplicaClient(t)
 		path := filepath.Join(t.TempDir(), "db")

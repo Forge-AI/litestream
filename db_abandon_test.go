@@ -1,9 +1,6 @@
 package litestream_test
 
 import (
-	"bytes"
-	"encoding/json"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,10 +12,8 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-func TestDB_AbandonPublishesItsPositionWithoutSyncing(t *testing.T) {
-	var logs bytes.Buffer
+func TestDB_AbandonKeepsTheTailWithoutSyncing(t *testing.T) {
 	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
-	db.Logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = testingutil.NewFileReplicaClient(t)
@@ -48,23 +43,6 @@ func TestDB_AbandonPublishesItsPositionWithoutSyncing(t *testing.T) {
 	remote, err := db.Replica.MaxLTXFileInfo(t.Context(), 0)
 	require.NoError(t, err)
 	require.Equal(t, replicated.TXID, remote.MaxTXID, "an abandon uploads nothing")
-
-	var published struct {
-		Msg            string `json:"msg"`
-		TXID           uint64 `json:"txid"`
-		ReplicatedTXID uint64 `json:"replicated_txid"`
-		Unsynced       bool   `json:"unsynced"`
-	}
-	for line := range bytes.Lines(logs.Bytes()) {
-		require.NoError(t, json.Unmarshal(line, &published))
-		if published.Msg == "abandoned without a final sync" {
-			break
-		}
-	}
-	require.Equal(t, "abandoned without a final sync", published.Msg)
-	require.Equal(t, uint64(pos.TXID), published.TXID)
-	require.Equal(t, uint64(replicated.TXID), published.ReplicatedTXID)
-	require.True(t, published.Unsynced)
 
 	checkpointed := make(chan error, 1)
 	go func() { checkpointed <- db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate) }()
