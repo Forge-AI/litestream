@@ -75,11 +75,11 @@ type DB struct {
 	pageSize  int           // page size, in bytes
 	notify    chan struct{} // closes on WAL change
 	chkMu     sync.RWMutex  // checkpoint lock
-	boundary  sync.Mutex    // held across a checkpoint and its boundary sync; Abandon keeps it
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
 	handover  handoverClaim
+	boundary  sync.Mutex
 
 	lastLTXPage *verifiedLTXPage
 
@@ -88,8 +88,6 @@ type DB struct {
 		sync.Mutex
 		m map[int]*ltx.FileInfo
 
-		// The inputs of the last L0 retention run that left no file to age
-		// past retention. Nil until such a run.
 		l0RetentionSettled *l0RetentionKey
 	}
 
@@ -254,9 +252,6 @@ type syncState struct {
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
 
-	// handoverTXID is a position the server proved this database file holds
-	// with nothing folded in since, so a WAL that no longer continues the
-	// last LTX file resumes from its header instead of snapshotting.
 	handoverTXID ltx.TXID
 }
 
@@ -265,18 +260,11 @@ type handoverClaim struct {
 	proof *HandoverProof
 }
 
-// HandoverProof answers whether a hand-over's transaction ID is this
-// database's replicated position, which lets the next sync resume the WAL
-// the server truncated instead of snapshotting.
 type HandoverProof struct {
 	Continued bool   `json:"continued"`
 	TXID      uint64 `json:"txid"`
 }
 
-// SetHandover records the transaction ID a server's hand-over says the
-// database's replica ends at. The server vouches that the database file
-// holds exactly that state and that every write since sits in the current
-// WAL. Call before Open; the first sync executor checks it.
 func (db *DB) SetHandover(txid ltx.TXID) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -289,8 +277,6 @@ func (db *DB) HandoverClaimed() bool {
 	return db.handover.txid != 0 || db.handover.proof != nil
 }
 
-// ProveHandover runs the first sync executor's check of the claim
-// SetHandover recorded and returns its verdict.
 func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
 	if err := db.lockExec(ctx); err != nil {
 		return HandoverProof{}, err
@@ -1062,29 +1048,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	return err
 }
 
-// Abandon waits out an in-flight checkpoint and bars every later one, then
-// logs the position the next process resumes from. It neither syncs nor
-// closes, so the WAL tail no replica holds stays on disk for that process.
 func (db *DB) Abandon() {
 	db.boundary.Lock()
-	pos, err := db.Pos()
-	if err != nil {
-		db.Logger.Error("abandoned without a readable position", "error", err)
-		return
-	}
-	var replicated ltx.Pos
-	if db.Replica != nil {
-		replicated = db.Replica.Pos()
-	}
-	unsynced := pos.TXID > replicated.TXID
-	level := slog.LevelInfo
-	if unsynced {
-		level = slog.LevelWarn
-	}
-	db.Logger.Log(context.Background(), level, "abandoned without a final sync",
-		"txid", uint64(pos.TXID),
-		"replicated_txid", uint64(replicated.TXID),
-		"unsynced", unsynced)
 }
 
 // syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
@@ -1471,16 +1436,7 @@ func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func
 	lifetime := db.ctx
 	db.mu.RUnlock()
 
-	started := time.Now()
-	result, err := db.syncLocked(lifetime, maxSyncWALBytes)
-	if ctx.Err() != nil {
-		db.Logger.Warn("a sync outlived its caller; finished it so a checkpoint never stops halfway",
-			"cause", context.Cause(ctx),
-			"elapsed_seconds", time.Since(started).Seconds(),
-			"synced", result.synced,
-			"error", err)
-	}
-	return result, err
+	return db.syncLocked(lifetime, maxSyncWALBytes)
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
@@ -1970,16 +1926,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	db.invalidatePosCache()
 	db.Replica.SetPos(ltx.Pos{TXID: maxTXID})
 
-	db.Logger.Info("fetched latest replicated file from replica",
+	db.Logger.Info("fetched latest L0 file from replica",
 		"min_txid", minTXID,
 		"max_txid", maxTXID)
 
 	return nil
 }
 
-// rebaseLTX re-encodes an LTX file under a later MinTXID. Applying a file's
-// full page set to any state within its range yields the state at its
-// MaxTXID, so the relabelled file stays a valid step from minTXID-1.
 func rebaseLTX(rd io.ReadCloser, minTXID ltx.TXID) io.ReadCloser {
 	pr, pw := io.Pipe()
 	go func() {
@@ -2053,9 +2006,6 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncI
 	if err != nil {
 		return info, fmt.Errorf("read wal header after hand-over: %w", err)
 	}
-	db.Logger.Info("resuming the handed-over wal from its header",
-		"txid", exec.pos.TXID.String(),
-		"instead_of", info.reason)
 	return syncInfo{
 		offset:              WALHeaderSize,
 		salt1:               binary.BigEndian.Uint32(hdr[16:]),
@@ -2348,11 +2298,6 @@ func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
 		proof := HandoverProof{Continued: pos.TXID == claimed, TXID: uint64(pos.TXID)}
 		if proof.Continued {
 			db.syncState.handoverTXID = claimed
-			db.Logger.Info("hand-over position proven", "txid", claimed.String())
-		} else {
-			db.Logger.Warn("hand-over position differs from the replicated position; the next sync snapshots",
-				"handover_txid", claimed.String(),
-				"txid", pos.TXID.String())
 		}
 		db.handover = handoverClaim{proof: &proof}
 	}
@@ -3611,9 +3556,6 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	return nil
 }
 
-// l0RetentionKey holds what decides which L0 files retention deletes: the
-// cached L0 and L1 max TXIDs, the replica's uploaded position, and the
-// retention settings. A sync, upload or compaction changes one of them.
 type l0RetentionKey struct {
 	l0, uploaded, l1 ltx.TXID
 	retention        time.Duration

@@ -1262,8 +1262,6 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 	}
 }
 
-// An idle database's L0 retention lists the replica until nothing is left to
-// age past retention, then stops until a sync or compaction moves L0 or L1.
 func TestDB_EnforceL0RetentionByTime_IdleSkipsListing(t *testing.T) {
 	client := &listCountingClient{ReplicaClient: testingutil.NewFileReplicaClient(t)}
 	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))

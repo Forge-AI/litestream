@@ -559,8 +559,6 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	return err
 }
 
-// Abandon stops replication without closing a database: no final sync and no
-// close-time checkpoint, so the next process resumes from the kept WAL.
 func (c *ReplicateCommand) Abandon() {
 	if c.Store == nil {
 		return
