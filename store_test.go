@@ -266,6 +266,66 @@ func TestStore_CompactDB(t *testing.T) {
 		require.Equal(t, ltx.TXID(3), info.MaxTXID)
 	})
 
+	// A database reopened after another writer replicated to its path must
+	// compact those files even when it writes nothing itself.
+	t.Run("L1AfterReopen", func(t *testing.T) {
+		client := testingutil.NewFileReplicaClient(t)
+		path := filepath.Join(t.TempDir(), "db")
+		openDB := func() *litestream.DB {
+			db := testingutil.NewDB(t, path)
+			db.MonitorInterval = 0
+			db.ShutdownSyncTimeout = 0
+			db.Replica = litestream.NewReplica(db)
+			db.Replica.Client = client
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			return db
+		}
+		db0 := openDB()
+		sqldb0 := testingutil.MustOpenSQLDB(t, db0.Path())
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
+		write := func(db *litestream.DB, query string) {
+			if _, err := sqldb0.ExecContext(t.Context(), query); err != nil {
+				t.Fatal(err)
+			} else if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			} else if err := db.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 1 * time.Second},
+		}
+		s := litestream.NewStore([]*litestream.DB{db0}, levels)
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		write(db0, `CREATE TABLE t (id INT);`)
+		write(db0, `INSERT INTO t (id) VALUES (100)`)
+		info, err := s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Equal(t, ltx.TXID(2), info.MaxTXID)
+
+		require.NoError(t, db0.Close(t.Context()))
+		db1 := openDB()
+		write(db1, `INSERT INTO t (id) VALUES (200)`)
+		require.NoError(t, db1.Close(t.Context()))
+
+		require.NoError(t, db0.Open())
+		require.NoError(t, db0.Sync(t.Context()))
+		time.Sleep(levels[1].Interval)
+		info, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Equal(t, ltx.TXID(3), info.MinTXID)
+	})
+
 	// Regression test for GitHub issue #877: level 9 compaction fails with
 	// "page size not initialized yet" error when attempted before DB initialization.
 	t.Run("DBNotReady", func(t *testing.T) {

@@ -257,6 +257,16 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
+
+	// Raise a cached L0 position that a failed local sync left behind the
+	// replica, so idle compaction still sees the file this upload added.
+	if level == 0 {
+		r.db.maxLTXFileInfos.Lock()
+		if cached, ok := r.db.maxLTXFileInfos.m[0]; ok && cached.MaxTXID < info.MaxTXID {
+			r.db.maxLTXFileInfos.m[0] = info
+		}
+		r.db.maxLTXFileInfos.Unlock()
+	}
 	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
 		"minTXID", info.MinTXID,
@@ -277,6 +287,20 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 		return pos, fmt.Errorf("max ltx file: %w", err)
 	}
 	return ltx.Pos{TXID: info.MaxTXID}, nil
+}
+
+func (r *Replica) maxRestorableLTXFileInfo(ctx context.Context) (ltx.FileInfo, error) {
+	var latest ltx.FileInfo
+	for level := 0; level <= SnapshotLevel; level++ {
+		info, err := r.MaxLTXFileInfo(ctx, level)
+		if err != nil {
+			return ltx.FileInfo{}, err
+		}
+		if info.MaxTXID > latest.MaxTXID {
+			latest = info
+		}
+	}
+	return latest, nil
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
@@ -793,12 +817,13 @@ func (r *Replica) restore(ctx context.Context, opt RestoreOptions, restoredTXID 
 		r.Logger().Info("post-restore integrity check passed")
 	}
 
+	maxTXID := infos[len(infos)-1].MaxTXID
+	if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
+		return fmt.Errorf("write initial txid file: %w", err)
+	}
+
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		maxTXID := infos[len(infos)-1].MaxTXID
-		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
-			return fmt.Errorf("write initial txid file: %w", err)
-		}
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
 	}
 

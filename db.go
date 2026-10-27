@@ -75,9 +75,11 @@ type DB struct {
 	pageSize  int           // page size, in bytes
 	notify    chan struct{} // closes on WAL change
 	chkMu     sync.RWMutex  // checkpoint lock
+	boundary  sync.Mutex    // held across a checkpoint and its boundary sync; Abandon keeps it
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+	handover  handoverClaim
 
 	lastLTXPage *verifiedLTXPage
 
@@ -85,6 +87,10 @@ type DB struct {
 	maxLTXFileInfos struct {
 		sync.Mutex
 		m map[int]*ltx.FileInfo
+
+		// The inputs of the last L0 retention run that left no file to age
+		// past retention. Nil until such a run.
+		l0RetentionSettled *l0RetentionKey
 	}
 
 	// Cached position from the latest L0 LTX file.
@@ -247,6 +253,66 @@ type syncState struct {
 	// a checkpoint. This prevents issue #997 where PASSIVE checkpoints
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
+
+	// handoverTXID is a position the server proved this database file holds
+	// with nothing folded in since, so a WAL that no longer continues the
+	// last LTX file resumes from its header instead of snapshotting.
+	handoverTXID ltx.TXID
+}
+
+type handoverClaim struct {
+	txid  ltx.TXID
+	proof *HandoverProof
+}
+
+// HandoverProof answers whether a hand-over's transaction ID is this
+// database's replicated position, which lets the next sync resume the WAL
+// the server truncated instead of snapshotting.
+type HandoverProof struct {
+	Continued bool   `json:"continued"`
+	TXID      uint64 `json:"txid"`
+}
+
+// SetHandover records the transaction ID a server's hand-over says the
+// database's replica ends at. The server vouches that the database file
+// holds exactly that state and that every write since sits in the current
+// WAL. Call before Open; the first sync executor checks it.
+func (db *DB) SetHandover(txid ltx.TXID) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	db.handover = handoverClaim{txid: txid}
+}
+
+func (db *DB) HandoverClaimed() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.handover.txid != 0 || db.handover.proof != nil
+}
+
+// ProveHandover runs the first sync executor's check of the claim
+// SetHandover recorded and returns its verdict.
+func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
+	if err := db.lockExec(ctx); err != nil {
+		return HandoverProof{}, err
+	}
+	defer db.execSem.Release(1)
+
+	exec, err := db.newSyncExecutor(ctx)
+	if err == nil && exec == nil {
+		err = fmt.Errorf("prove hand-over: database file missing: %s", db.path)
+	}
+	if err != nil {
+		db.SetHandover(0)
+		return HandoverProof{}, err
+	}
+	db.applySyncExecutor(exec, false)
+
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.handover.proof == nil {
+		return HandoverProof{}, fmt.Errorf("prove hand-over: no hand-over claimed for %s", db.path)
+	}
+	return *db.handover.proof, nil
 }
 
 type syncExecutor struct {
@@ -310,6 +376,7 @@ type diagState struct {
 	err                 string
 	executorWaiterCount int
 	executorWaitStarted time.Time
+	snapshotStarted     chan struct{}
 }
 
 // SyncDiagnostic reports the latest DB sync/checkpoint activity.
@@ -536,11 +603,31 @@ func (db *DB) setSyncDiagPhase(phase diagPhase, updates ...func(*diagState)) {
 	if !db.syncDiag.active {
 		return
 	}
+	wasSnapshotting := db.syncDiag.snapshotting
 	db.syncDiag.phase = phase
 	db.syncDiag.updatedAt = time.Now()
 	for _, update := range updates {
 		update(&db.syncDiag)
 	}
+	if db.syncDiag.snapshotting && !wasSnapshotting && db.syncDiag.snapshotStarted != nil {
+		close(db.syncDiag.snapshotStarted)
+		db.syncDiag.snapshotStarted = nil
+	}
+}
+
+func (db *DB) snapshotStarts() <-chan struct{} {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.snapshotStarted == nil {
+		db.syncDiag.snapshotStarted = make(chan struct{})
+	}
+	return db.syncDiag.snapshotStarted
+}
+
+func (db *DB) runningSnapshot() bool {
+	db.syncDiag.RLock()
+	defer db.syncDiag.RUnlock()
+	return db.syncDiag.active && db.syncDiag.snapshotting
 }
 
 func (db *DB) finishSyncDiag(err error) {
@@ -617,9 +704,15 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	// Clear cached LTX file info
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.l0RetentionSettled = nil
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
+
+	db.mu.Lock()
+	db.syncState.handoverTXID = 0
+	db.handover = handoverClaim{}
+	db.mu.Unlock()
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
@@ -794,13 +887,14 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 }
 
 // SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
-// replica. Blocks until both stages complete.
+// replica. Blocks until both stages complete, except that it returns
+// ErrSnapshotting instead of queueing behind a full snapshot.
 func (db *DB) SyncAndWait(ctx context.Context) error {
 	if db.Replica == nil {
 		return fmt.Errorf("no replica configured")
 	}
 
-	if err := db.Sync(ctx); err != nil {
+	if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting); err != nil {
 		return fmt.Errorf("db sync: %w", err)
 	}
 	if err := db.Replica.Sync(ctx); err != nil {
@@ -945,6 +1039,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.f = nil
 	db.opened = false
 	db.rtx = nil
+	db.syncState.handoverTXID = 0
+	db.handover = handoverClaim{}
 	db.mu.Unlock()
 
 	if sqlDB != nil {
@@ -964,6 +1060,31 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.deleteMetrics()
 
 	return err
+}
+
+// Abandon waits out an in-flight checkpoint and bars every later one, then
+// logs the position the next process resumes from. It neither syncs nor
+// closes, so the WAL tail no replica holds stays on disk for that process.
+func (db *DB) Abandon() {
+	db.boundary.Lock()
+	pos, err := db.Pos()
+	if err != nil {
+		db.Logger.Error("abandoned without a readable position", "error", err)
+		return
+	}
+	var replicated ltx.Pos
+	if db.Replica != nil {
+		replicated = db.Replica.Pos()
+	}
+	unsynced := pos.TXID > replicated.TXID
+	level := slog.LevelInfo
+	if unsynced {
+		level = slog.LevelWarn
+	}
+	db.Logger.Log(context.Background(), level, "abandoned without a final sync",
+		"txid", uint64(pos.TXID),
+		"replicated_txid", uint64(replicated.TXID),
+		"unsynced", unsynced)
 }
 
 // syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
@@ -1212,6 +1333,11 @@ func (db *DB) init(ctx context.Context) (err error) {
 		}
 	}
 
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.l0RetentionSettled = nil
+	db.maxLTXFileInfos.Unlock()
+
 	// If we have an existing replication files, ensure the headers match.
 	// if err := db.verifyHeadersMatch(); err != nil {
 	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
@@ -1313,12 +1439,16 @@ func (db *DB) releaseReadLock() error {
 
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) error {
+	return db.syncWith(ctx, db.lockExec)
+}
+
+func (db *DB) syncWith(ctx context.Context, lock func(context.Context) error) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return context.Cause(ctx)
 		}
 
-		result, err := db.syncOnce(ctx, db.MaxSyncWALBytes)
+		result, err := db.syncOnceWith(ctx, db.MaxSyncWALBytes, lock)
 		if err != nil {
 			return err
 		} else if !result.synced || !result.limited || result.syncedToWALEnd {
@@ -1328,12 +1458,29 @@ func (db *DB) Sync(ctx context.Context) error {
 }
 
 func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, error) {
-	if err := db.lockExec(ctx); err != nil {
+	return db.syncOnceWith(ctx, maxSyncWALBytes, db.lockExec)
+}
+
+func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func(context.Context) error) (syncResult, error) {
+	if err := lock(ctx); err != nil {
 		return syncResult{}, err
 	}
 	defer db.execSem.Release(1)
 
-	return db.syncLocked(ctx, maxSyncWALBytes)
+	db.mu.RLock()
+	lifetime := db.ctx
+	db.mu.RUnlock()
+
+	started := time.Now()
+	result, err := db.syncLocked(lifetime, maxSyncWALBytes)
+	if ctx.Err() != nil {
+		db.Logger.Warn("a sync outlived its caller; finished it so a checkpoint never stops halfway",
+			"cause", context.Cause(ctx),
+			"elapsed_seconds", time.Since(started).Seconds(),
+			"synced", result.synced,
+			"error", err)
+	}
+	return result, err
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
@@ -1356,6 +1503,49 @@ func addDurationToCounter(counter prometheus.Counter, d time.Duration) {
 		counter.Add(d.Seconds())
 	}
 }
+
+func (db *DB) lockExecUnlessSnapshotting(ctx context.Context) error {
+	starts := db.snapshotStarts()
+	if db.runningSnapshot() {
+		started := make(chan struct{})
+		close(started)
+		starts = started
+	}
+
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	go func() {
+		for {
+			select {
+			case <-starts:
+			case <-ctx.Done():
+				return
+			}
+			starts = db.snapshotStarts()
+			select {
+			case <-time.After(snapshotYieldAfter):
+			case <-ctx.Done():
+				return
+			}
+			running := db.runningSnapshot()
+			select {
+			case <-starts:
+				continue
+			default:
+			}
+			if running {
+				cancel(ErrSnapshotting)
+				return
+			}
+		}
+	}()
+
+	return db.lockExec(ctx)
+}
+
+const snapshotYieldAfter = time.Second
+
+var ErrSnapshotting = errors.New("a full snapshot holds the db sync executor")
 
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
@@ -1683,9 +1873,11 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 // checkDatabaseBehindReplica detects when a database has been restored to an
 // earlier state and the replica has a higher TXID. This handles issue #781.
 //
-// If detected, it clears local L0 files and fetches the latest L0 LTX file
-// from the replica to establish a baseline. The next DB.sync() will detect
-// the mismatch and trigger a snapshot at the current database state.
+// If detected, it clears local L0 files and takes the highest replicated file
+// at any level as the baseline, so the next sync numbers its transactions
+// above every file a restore can choose. A baseline above L0 is re-encoded to
+// start right after L0's last TXID and uploaded to L0 first, which keeps L0
+// contiguous for compaction.
 func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	// Get database position from local L0 files
 	dbPos, err := db.Pos()
@@ -1694,7 +1886,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 
 	// Get replica position from remote
-	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	replicaInfo, err := db.Replica.maxRestorableLTXFileInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get replica position: %w", err)
 	} else if replicaInfo.MaxTXID == 0 {
@@ -1720,12 +1912,19 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("recreate L0 directory: %w", err)
 	}
 
-	// Fetch latest L0 LTX file from replica
 	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
-	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
-	if err != nil {
-		return fmt.Errorf("open remote L0 file: %w", err)
+	if replicaInfo.Level != 0 {
+		l0Info, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("get replica L0 position: %w", err)
+		}
+		minTXID = max(minTXID, l0Info.MaxTXID+1)
 	}
+	remote, err := db.Replica.Client.OpenLTXFile(ctx, replicaInfo.Level, replicaInfo.MinTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open remote baseline file: %w", err)
+	}
+	reader := rebaseLTX(remote, minTXID)
 	defer func() { _ = reader.Close() }()
 
 	// Write to temp file and atomically rename
@@ -1752,17 +1951,78 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("close L0 file: %w", err)
 	}
 
+	if replicaInfo.Level != 0 {
+		bridge, err := os.Open(tmpPath)
+		if err != nil {
+			return fmt.Errorf("open L0 bridge: %w", err)
+		}
+		_, err = db.Replica.Client.WriteLTXFile(ctx, 0, minTXID, maxTXID, bridge)
+		_ = bridge.Close()
+		if err != nil {
+			return fmt.Errorf("upload L0 bridge: %w", err)
+		}
+	}
+
 	// Atomically rename temp file to final path
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		return fmt.Errorf("rename L0 file: %w", err)
 	}
 	db.invalidatePosCache()
+	db.Replica.SetPos(ltx.Pos{TXID: maxTXID})
 
-	db.Logger.Info("fetched latest L0 file from replica",
+	db.Logger.Info("fetched latest replicated file from replica",
 		"min_txid", minTXID,
 		"max_txid", maxTXID)
 
 	return nil
+}
+
+// rebaseLTX re-encodes an LTX file under a later MinTXID. Applying a file's
+// full page set to any state within its range yields the state at its
+// MaxTXID, so the relabelled file stays a valid step from minTXID-1.
+func rebaseLTX(rd io.ReadCloser, minTXID ltx.TXID) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		err := copyRebasedLTX(pw, rd, minTXID)
+		_ = rd.Close()
+		_ = pw.CloseWithError(err)
+	}()
+	return pr
+}
+
+func copyRebasedLTX(w io.Writer, rd io.Reader, minTXID ltx.TXID) error {
+	dec := ltx.NewDecoder(rd)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode ltx header: %w", err)
+	}
+	hdr := dec.Header()
+	hdr.MinTXID = minTXID
+
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		return fmt.Errorf("encode rebased ltx header: %w", err)
+	}
+
+	data := make([]byte, hdr.PageSize)
+	for {
+		var pageHdr ltx.PageHeader
+		if err := dec.DecodePage(&pageHdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode ltx page: %w", err)
+		}
+		if err := enc.EncodePage(pageHdr, data); err != nil {
+			return fmt.Errorf("encode ltx page: %w", err)
+		}
+	}
+	if err := dec.Close(); err != nil {
+		return fmt.Errorf("close ltx decoder: %w", err)
+	}
+	enc.SetPostApplyChecksum(dec.Trailer().PostApplyChecksum)
+	return enc.Close()
 }
 
 // verify ensures the current LTX state matches where it left off from
@@ -1779,7 +2039,33 @@ func (db *DB) verify(ctx context.Context, state *syncState) (info syncInfo, err 
 	})
 }
 
-func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info syncInfo, err error) {
+func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncInfo, error) {
+	info, err := db.verifyWAL(ctx, exec)
+	if err != nil || !info.snapshotting || exec.state.handoverTXID == 0 {
+		return info, err
+	}
+	if exec.pos.TXID != exec.state.handoverTXID {
+		exec.state.handoverTXID = 0
+		return info, nil
+	}
+
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return info, fmt.Errorf("read wal header after hand-over: %w", err)
+	}
+	db.Logger.Info("resuming the handed-over wal from its header",
+		"txid", exec.pos.TXID.String(),
+		"instead_of", info.reason)
+	return syncInfo{
+		offset:              WALHeaderSize,
+		salt1:               binary.BigEndian.Uint32(hdr[16:]),
+		salt2:               binary.BigEndian.Uint32(hdr[20:]),
+		prevCommit:          info.prevCommit,
+		clearSyncedToWALEnd: true,
+	}, nil
+}
+
+func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo, err error) {
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
@@ -1789,7 +2075,11 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	}
 
 	// Determine last WAL offset we save from.
-	ltxPath := db.LTXPath(0, exec.pos.TXID, exec.pos.TXID)
+	minTXID, _, err := db.MaxLTX()
+	if err != nil {
+		return info, fmt.Errorf("max local ltx: %w", err)
+	}
+	ltxPath := db.LTXPath(0, minTXID, exec.pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
 	if err != nil {
 		return info, NewLTXError("open", ltxPath, 0, uint64(exec.pos.TXID), uint64(exec.pos.TXID), err)
@@ -2027,6 +2317,7 @@ func (db *DB) applySyncResult(state *syncState, result syncResult) {
 	state.lastSyncedWALOffset = result.newWALSize
 	state.syncedToWALEnd = result.syncedToWALEnd
 	if result.pos != nil {
+		state.handoverTXID = 0
 		db.pos.Lock()
 		db.pos.value = result.pos
 		db.pos.Unlock()
@@ -2051,6 +2342,19 @@ func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
 	pos, err := db.Pos()
 	if err != nil {
 		return nil, fmt.Errorf("pos: %w", err)
+	}
+
+	if claimed := db.handover.txid; claimed != 0 {
+		proof := HandoverProof{Continued: pos.TXID == claimed, TXID: uint64(pos.TXID)}
+		if proof.Continued {
+			db.syncState.handoverTXID = claimed
+			db.Logger.Info("hand-over position proven", "txid", claimed.String())
+		} else {
+			db.Logger.Warn("hand-over position differs from the replicated position; the next sync snapshots",
+				"handover_txid", claimed.String(),
+				"txid", pos.TXID.String())
+		}
+		db.handover = handoverClaim{proof: &proof}
 	}
 
 	return &syncExecutor{
@@ -2096,6 +2400,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 	if result.pos != nil {
 		exec.pos = *result.pos
 		exec.posChanged = true
+		exec.state.handoverTXID = 0
 	}
 	if result.l0FileInfo != nil {
 		info := *result.l0FileInfo
@@ -2524,6 +2829,23 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 		return err
 	}
 	defer db.execSem.Release(1)
+	return db.checkpointLocked(ctx, mode)
+}
+
+func (db *DB) CheckpointOutlivingCaller(ctx context.Context, mode string) error {
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
+	defer db.execSem.Release(1)
+
+	db.mu.RLock()
+	lifetime := db.ctx
+	db.mu.RUnlock()
+
+	return db.checkpointLocked(lifetime, mode)
+}
+
+func (db *DB) checkpointLocked(ctx context.Context, mode string) (err error) {
 	db.beginSyncDiag(diagOpCheckpoint)
 	defer func() { db.finishSyncDiag(err) }()
 
@@ -2590,6 +2912,8 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		return false, nil
 	}
 	defer db.chkMu.Unlock()
+	db.boundary.Lock()
+	defer db.boundary.Unlock()
 	exec.checkpointAttempted = true
 
 	// Read WAL header before checkpoint to check if it has been restarted.
@@ -2896,7 +3220,11 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 		return WALHeaderSize, nil
 	}
 
-	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	minTXID, _, err := db.MaxLTX()
+	if err != nil {
+		return 0, fmt.Errorf("max local ltx: %w", err)
+	}
+	ltxPath := db.LTXPath(0, minTXID, pos.TXID)
 	f, err := os.Open(ltxPath)
 	if err != nil {
 		return 0, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
@@ -3148,6 +3476,11 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
+	key, keyed := db.l0RetentionKey()
+	if keyed && db.l0RetentionSettledAt(key) {
+		return nil
+	}
+
 	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
 
 	dbName := filepath.Base(db.Path())
@@ -3164,6 +3497,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			maxL1TXID = info.MaxTXID
 		}
 	}
+	keyed = keyed && itr.Err() == nil
 	if err := itr.Close(); err != nil {
 		return fmt.Errorf("close l1 iterator: %w", err)
 	}
@@ -3171,6 +3505,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(0)
+		if keyed {
+			db.settleL0Retention(key)
+		}
 		return nil
 	}
 
@@ -3241,7 +3578,11 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		"too_recent", tooRecentCount,
 		"max_l1_txid", maxL1TXID)
 
+	keyed = keyed && itr.Err() == nil
 	if len(deleted) == 0 {
+		if keyed && processedAll {
+			db.settleL0Retention(key)
+		}
 		return nil
 	}
 
@@ -3264,7 +3605,50 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
+	if keyed && processedAll {
+		db.settleL0Retention(key)
+	}
 	return nil
+}
+
+// l0RetentionKey holds what decides which L0 files retention deletes: the
+// cached L0 and L1 max TXIDs, the replica's uploaded position, and the
+// retention settings. A sync, upload or compaction changes one of them.
+type l0RetentionKey struct {
+	l0, uploaded, l1 ltx.TXID
+	retention        time.Duration
+	deletes          bool
+}
+
+func (db *DB) l0RetentionKey() (l0RetentionKey, bool) {
+	uploaded := db.Replica.Pos().TXID
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	l0, ok0 := db.maxLTXFileInfos.m[0]
+	l1, ok1 := db.maxLTXFileInfos.m[1]
+	if !ok0 || !ok1 {
+		return l0RetentionKey{}, false
+	}
+	return l0RetentionKey{
+		l0:        l0.MaxTXID,
+		uploaded:  uploaded,
+		l1:        l1.MaxTXID,
+		retention: db.L0Retention,
+		deletes:   db.RetentionEnabled,
+	}, true
+}
+
+func (db *DB) l0RetentionSettledAt(key l0RetentionKey) bool {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	settled := db.maxLTXFileInfos.l0RetentionSettled
+	return settled != nil && *settled == key
+}
+
+func (db *DB) settleL0Retention(key l0RetentionKey) {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	db.maxLTXFileInfos.l0RetentionSettled = &key
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below

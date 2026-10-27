@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
@@ -1259,6 +1260,61 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 			}
 		}
 	}
+}
+
+// An idle database's L0 retention lists the replica until nothing is left to
+// age past retention, then stops until a sync or compaction moves L0 or L1.
+func TestDB_EnforceL0RetentionByTime_IdleSkipsListing(t *testing.T) {
+	client := &listCountingClient{ReplicaClient: testingutil.NewFileReplicaClient(t)}
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = client
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	write := func(query string) {
+		t.Helper()
+		if _, err := sqldb.ExecContext(t.Context(), query); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	retentionLists := func() int {
+		t.Helper()
+		client.reset()
+		if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		return client.listCount()
+	}
+
+	db.L0Retention = time.Hour
+	write(`CREATE TABLE t (id INT);`)
+	write(`INSERT INTO t (id) VALUES (1)`)
+	if _, err := db.Compact(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	require.Equal(t, 2, retentionLists(), "files still too recent")
+	require.Equal(t, 2, retentionLists(), "an idle database with files still aging")
+
+	db.L0Retention = time.Nanosecond
+	time.Sleep(10 * time.Millisecond)
+	require.Equal(t, 2, retentionLists(), "aged files")
+	require.Equal(t, 0, retentionLists(), "an idle settled database")
+
+	write(`INSERT INTO t (id) VALUES (2)`)
+	time.Sleep(10 * time.Millisecond)
+	require.Equal(t, 2, retentionLists(), "a new L0 file")
+	require.Equal(t, 0, retentionLists(), "idle again")
 }
 
 func TestDB_EnforceL0RetentionByTime(t *testing.T) {

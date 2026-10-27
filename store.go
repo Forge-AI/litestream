@@ -15,6 +15,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 var (
@@ -447,11 +449,12 @@ type SyncDBResult struct {
 }
 
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
-// until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
+// until both WAL-to-LTX and LTX-to-remote sync complete. If checkpoint is
+// true, runs one passive checkpoint, which syncs the WAL before it. Otherwise
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
 // Lock waits are context-aware: the timeout is honored while waiting for
 // the database sync executor and the replica sync lock.
-func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
+func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) (SyncDBResult, error) {
 	db := s.FindDB(path)
 	if db == nil {
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
@@ -466,11 +469,19 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
 	}
 
-	if wait {
+	switch {
+	case checkpoint:
+		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil {
+			if !isSQLiteBusyError(err) {
+				return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
+			}
+			db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+		}
+	case wait:
 		if err := db.SyncAndWait(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
-	} else {
+	default:
 		if err := db.Sync(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}

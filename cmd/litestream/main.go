@@ -139,6 +139,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		cmd, args = args[0], args[1:]
 	}
 
+	owner, err := exitWithOwner(ctx)
+	if err != nil {
+		return err
+	}
+
 	switch {
 	case cmd == "":
 		m.Usage()
@@ -146,7 +151,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case cmd == "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
 	case cmd == "replicate":
-		return m.runReplicate(ctx, args)
+		return m.runReplicate(ctx, owner, args)
 
 	case cmd == "start":
 		return (&StartCommand{}).Run(ctx, args)
@@ -159,7 +164,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case cmd == "reset":
 		return (&ResetCommand{}).Run(ctx, args)
 	case cmd == "restore":
-		return (&RestoreCommand{}).Run(ctx, args)
+		return (&RestoreCommand{}).Run(owner, args)
 	case cmd == "status":
 		return (&StatusCommand{}).Run(ctx, args)
 	case cmd == "sync":
@@ -742,6 +747,7 @@ type CompactionLevelConfig struct {
 
 // DBConfig represents the configuration for a single database or directory of databases.
 type DBConfig struct {
+	HandoverTXID       uint64         `yaml:"handover-txid"`
 	Path               string         `yaml:"path"`
 	Dir                string         `yaml:"dir"`       // Directory to scan for databases
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
@@ -776,6 +782,7 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 
 	// Initialize database with given path.
 	db := litestream.NewDB(configPath)
+	db.SetHandover(ltx.TXID(dbc.HandoverTXID))
 
 	// Override default database settings if specified in configuration.
 	if dbc.MetaPath != nil {
