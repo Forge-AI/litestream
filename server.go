@@ -567,9 +567,11 @@ type InfoResponse struct {
 
 // RegisterDatabaseRequest is the request body for the /register endpoint.
 type RegisterDatabaseRequest struct {
-	Path         string `json:"path"`
-	ReplicaURL   string `json:"replica_url"`
-	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	Path              string `json:"path"`
+	ReplicaURL        string `json:"replica_url"`
+	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
+	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
+	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -637,9 +639,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		db.SetHandover(ltx.TXID(req.HandoverTXID))
 	}
 
+	if req.MonitorIntervalMS > 0 {
+		db.MonitorInterval = time.Duration(req.MonitorIntervalMS) * time.Millisecond
+	}
+
 	// Create replica and attach client.
 	replica := NewReplica(db)
 	replica.Client = client
+	if req.SyncIntervalMS > 0 {
+		replica.SyncInterval = time.Duration(req.SyncIntervalMS) * time.Millisecond
+	}
 	db.Replica = replica
 
 	// Register database with store (this also opens the database).
