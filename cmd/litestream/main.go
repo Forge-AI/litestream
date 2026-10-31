@@ -762,6 +762,8 @@ type DBConfig struct {
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
 	MaxSyncWALBytes    *int64         `yaml:"max-sync-wal-bytes"`
+	SyncDriven         bool           `yaml:"sync-driven"`
+	Retention          *bool          `yaml:"retention"`
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
 
@@ -810,6 +812,10 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MaxSyncWALBytes != nil {
 		db.MaxSyncWALBytes = *dbc.MaxSyncWALBytes
+	}
+	db.SyncDriven = dbc.SyncDriven
+	if dbc.Retention != nil {
+		db.RetentionEnabled = *dbc.Retention
 	}
 
 	// Instantiate and attach replica.
@@ -1181,6 +1187,9 @@ type ReplicaSettings struct {
 	AccountKey  string `yaml:"account-key"`
 	SASToken    string `yaml:"sas-token"`
 
+	CredentialsURL   string `yaml:"credentials-url"`
+	CredentialsToken string `yaml:"credentials-token"`
+
 	// SFTP settings
 	Host             string `yaml:"host"`
 	User             string `yaml:"user"`
@@ -1214,6 +1223,10 @@ type ReplicaSettings struct {
 		Identities []string `yaml:"identities"`
 		Recipients []string `yaml:"recipients"`
 	} `yaml:"age"`
+}
+
+func (rs *ReplicaSettings) credentialSource() litestream.CredentialSource {
+	return litestream.CredentialSource{URL: rs.CredentialsURL, Token: rs.CredentialsToken}
 }
 
 // SetDefaults merges default settings from src into the current ReplicaSettings.
@@ -1699,6 +1712,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client := s3.NewReplicaClient()
 	client.AccessKeyID = c.AccessKeyID
 	client.SecretAccessKey = c.SecretAccessKey
+	client.Credentials = c.credentialSource()
 	client.Bucket = bucket
 	client.Path = configPath
 	client.Region = region
@@ -1809,6 +1823,7 @@ func newGSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *g
 	client := gs.NewReplicaClient()
 	client.Bucket = bucket
 	client.Path = configPath
+	client.Credentials = c.credentialSource()
 	return client, nil
 }
 
@@ -1826,6 +1841,7 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *
 	client.AccountName = c.AccountName
 	client.AccountKey = c.AccountKey
 	client.SASToken = c.SASToken
+	client.Credentials = c.credentialSource()
 	client.Bucket = c.Bucket
 	client.Path = c.Path
 	client.Endpoint = c.Endpoint
