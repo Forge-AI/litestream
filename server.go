@@ -78,6 +78,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
 	mux.HandleFunc("POST /register", s.handleRegister)
+	mux.HandleFunc("POST /register-driven", s.handleRegisterDriven)
 	mux.HandleFunc("POST /unregister", s.handleUnregister)
 	mux.HandleFunc("POST /sync", s.handleSync)
 	mux.HandleFunc("GET /list", s.handleList)
@@ -574,6 +575,17 @@ type RegisterDatabaseRequest struct {
 	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
 }
 
+// RegisterDrivenRequest is the request body for the /register-driven endpoint.
+// The database runs no loop of its own: it syncs, and checkpoints PASSIVE,
+// only when /sync wakes it, and its registration replaces a stopped one.
+// Retention, when set, is the database's own and only narrows the store's.
+type RegisterDrivenRequest struct {
+	Path         string `json:"path"`
+	ReplicaURL   string `json:"replica_url"`
+	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	Retention    *bool  `json:"retention,omitempty"`
+}
+
 // RegisterDatabaseResponse is the response body for the /register endpoint.
 type RegisterDatabaseResponse struct {
 	Status   string         `json:"status"`
@@ -652,6 +664,82 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	db.Replica = replica
 
 	// Register database with store (this also opens the database).
+	if err := s.store.RegisterDB(db); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
+		return
+	}
+
+	var handover *HandoverProof
+	if req.HandoverTXID != 0 {
+		proof, err := db.ProveHandover(s.ctx)
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to prove hand-over: %v", err), nil)
+			return
+		}
+		handover = &proof
+	}
+
+	writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+		Status:   "registered",
+		Path:     expandedPath,
+		Handover: handover,
+	})
+}
+
+func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
+	var req RegisterDrivenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	if req.ReplicaURL == "" {
+		writeJSONError(w, http.StatusBadRequest, "replica_url required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	if existing := s.store.FindDB(expandedPath); existing != nil && existing.IsOpen() {
+		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+			Status: "already_registered",
+			Path:   expandedPath,
+		})
+		return
+	} else if existing != nil {
+		if err := s.store.UnregisterDB(s.ctx, expandedPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to replace stopped database: %v", err), nil)
+			return
+		}
+	}
+
+	client, err := NewReplicaClientFromURL(req.ReplicaURL)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid replica url: %v", err), nil)
+		return
+	}
+
+	db := NewDB(expandedPath)
+	db.SyncDriven = true
+	if req.Retention != nil {
+		db.RetentionEnabled = *req.Retention
+	}
+	if req.HandoverTXID != 0 {
+		db.SetHandover(ltx.TXID(req.HandoverTXID))
+	}
+	replica := NewReplica(db)
+	replica.Client = client
+	db.Replica = replica
+
 	if err := s.store.RegisterDB(db); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
 		return

@@ -29,6 +29,7 @@ import (
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/credentials/endpointcreds"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -84,6 +85,12 @@ type contentMD5StackKey struct{}
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
+var skipVerifyTransport = func() *http.Transport {
+	transport := litestream.Transport.Clone()
+	transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	return transport
+}()
+
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
 	mu       sync.Mutex
@@ -94,6 +101,7 @@ type ReplicaClient struct {
 	// AWS authentication keys.
 	AccessKeyID     string
 	SecretAccessKey string
+	Credentials     litestream.CredentialSource
 
 	// S3 bucket information
 	Region              string
@@ -301,6 +309,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 
 	// Configure client
+	client.Credentials = litestream.CredentialSourceFromQuery(query)
 	client.Bucket = bucket
 	client.Path = urlPath
 	client.Region = region
@@ -392,30 +401,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Create HTTP client with 24 hour timeout for long-running operations
 	httpClient := &http.Client{
-		Timeout: 24 * time.Hour,
+		Timeout:   24 * time.Hour,
+		Transport: litestream.Transport,
 	}
-
-	// Always configure custom HTTP Transport with controlled keepalive settings
-	// to reduce idle CPU usage from default transport's aggressive keepalives.
-	// See: https://github.com/benbjohnson/litestream/issues/992
-	httpClient.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	// Configure TLS to skip verification if requested
 	if c.SkipVerify {
-		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
+		httpClient.Transport = skipVerifyTransport
 	}
 
 	// Build configuration options
@@ -434,10 +424,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// - EC2 Instance Profile credentials
 	// - ECS Task Role credentials
 	// - Web Identity Token credentials (for EKS)
-	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
-		configOpts = append(configOpts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
-		))
+	if provider := c.credentialsProvider(); provider != nil {
+		configOpts = append(configOpts, config.WithCredentialsProvider(provider))
 	}
 
 	// Enable AWS SDK debug logging if LITESTREAM_S3_DEBUG is set.
@@ -622,6 +610,19 @@ func newTransportRetryer() aws.Retryer {
 	})
 }
 
+func (c *ReplicaClient) credentialsProvider() aws.CredentialsProvider {
+	if c.Credentials.URL != "" {
+		return aws.NewCredentialsCache(endpointcreds.New(c.Credentials.URL, func(o *endpointcreds.Options) {
+			o.AuthorizationToken = c.Credentials.Token
+			o.HTTPClient = &http.Client{Transport: litestream.Transport}
+		}))
+	}
+	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
+		return credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, "")
+	}
+	return nil
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
@@ -630,10 +631,8 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 	}
 
 	// Add static credentials if provided
-	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
-		configOpts = append(configOpts, config.WithCredentialsProvider(
-			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
-		))
+	if provider := c.credentialsProvider(); provider != nil {
+		configOpts = append(configOpts, config.WithCredentialsProvider(provider))
 	}
 
 	// Load AWS configuration
