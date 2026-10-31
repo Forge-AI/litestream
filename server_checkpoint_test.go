@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 )
 
 func TestServer_SyncCheckpointDrainsASyncedOnePageLog(t *testing.T) {
@@ -107,6 +109,44 @@ func TestServer_SyncRefusesACheckpointThatWaits(t *testing.T) {
 	status, answer := postSync(t, serveSyncs(t), litestream.SyncRequest{Path: "/db", Wait: true, Checkpoint: true})
 	if status != http.StatusBadRequest {
 		t.Fatalf("status=%d error=%q, want 400", status, answer.Error)
+	}
+}
+
+func TestDB_CompactionAndSnapshotNameTheirUploadsInTheMetaDirectory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	db := openHandoverPublisher(t, filepath.Join(dir, "db"), file.NewReplicaClient(filepath.Join(dir, "replica")))
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+	sqldb := openServerSQLDB(t, ctx, db.Path())
+	t.Cleanup(func() { _ = sqldb.Close() })
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	insertHandoverRows(t, ctx, sqldb, 1, 4)
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	l1, err := db.Compact(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := db.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	named, err := os.ReadFile(filepath.Join(db.MetaPath(), "compacted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("{\"level\":1,\"min\":%d,\"max\":%d,\"size\":%d}\n{\"level\":%d,\"min\":%d,\"max\":%d,\"size\":%d}\n",
+		l1.MinTXID, l1.MaxTXID, l1.Size, litestream.SnapshotLevel, snapshot.MinTXID, snapshot.MaxTXID, snapshot.Size)
+	if string(named) != want {
+		t.Fatalf("compacted file:\n%s\nwant:\n%s", named, want)
 	}
 }
 
