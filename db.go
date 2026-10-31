@@ -3548,6 +3548,9 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if err != nil {
 		return nil, err
 	}
+	if err := db.nameCompacted(info); err != nil {
+		return info, err
+	}
 
 	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
@@ -3582,7 +3585,26 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.m[SnapshotLevel] = info
 	db.maxLTXFileInfos.Unlock()
 
-	return info, nil
+	return info, db.nameCompacted(info)
+}
+
+func (db *DB) nameCompacted(info *ltx.FileInfo) error {
+	f, err := os.OpenFile(filepath.Join(db.MetaPath(), "compacted"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("open the compacted file: %w", err)
+	}
+	if _, err := fmt.Fprintf(f, "{\"level\":%d,\"min\":%d,\"max\":%d,\"size\":%d}\n", info.Level, info.MinTXID, info.MaxTXID, info.Size); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("name level %d file %s-%s: %w", info.Level, info.MinTXID, info.MaxTXID, err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("sync the compacted file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close the compacted file: %w", err)
+	}
+	return internal.FsyncDir(db.MetaPath())
 }
 
 // EnforceSnapshotRetention enforces retention of the snapshot level in the database by timestamp.
