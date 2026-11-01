@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
@@ -2139,7 +2140,7 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 	}
 
 	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
-	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	lastPageMatch, err := db.lastPageMatch(ltxFile, dec.Header(), prevWALOffset, frameSize)
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
@@ -2179,7 +2180,7 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 }
 
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
-func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+func (db *DB) lastPageMatch(ltxFile *os.File, hdr ltx.Header, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
 		return false, nil
 	}
@@ -2193,36 +2194,60 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 	fsalt2 := binary.BigEndian.Uint32(frame[12:])
 	data := frame[WALFrameHeaderSize:]
 
-	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+	if fsalt1 != hdr.WALSalt1 || fsalt2 != hdr.WALSalt2 {
 		return false, nil
 	}
 
-	if page := db.lastLTXPage; page != nil && page.header == dec.Header() && page.pgno == pgno {
+	if page := db.lastLTXPage; page != nil && page.header == hdr && page.pgno == pgno {
 		return bytes.Equal(data, page.data), nil
 	}
 
 	// Verify that the last page in the WAL exists in the last LTX file.
-	buf := make([]byte, dec.Header().PageSize)
-	for {
-		if err := context.Cause(ctx); err != nil {
-			return false, err
-		}
-		var hdr ltx.PageHeader
-		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
-			return false, nil // page not found in LTX file
-		} else if err != nil {
-			return false, fmt.Errorf("decode ltx page: %w", err)
-		}
-
-		if pgno != hdr.Pgno {
-			continue // page number doesn't match
-		}
-		if !bytes.Equal(data, buf) {
-			continue // page data doesn't match
-		}
-		db.lastLTXPage = &verifiedLTXPage{header: dec.Header(), pgno: pgno, data: bytes.Clone(buf)}
-		return true, nil // Page matches
+	index, pagesEnd, err := readLocalPageIndex(ltxFile)
+	if err != nil {
+		return false, fmt.Errorf("read ltx page index: %w", err)
 	}
+	elem, ok := index[pgno]
+	if !ok {
+		return false, nil // page not found in LTX file
+	}
+	if elem.Offset < ltx.HeaderSize || elem.Offset >= pagesEnd || elem.Size <= 0 || elem.Size > pagesEnd-elem.Offset {
+		return false, fmt.Errorf("ltx page index places page %d at %d+%d, outside the pages ending at %d", pgno, elem.Offset, elem.Size, pagesEnd)
+	}
+	b := make([]byte, elem.Size)
+	if _, err := ltxFile.ReadAt(b, elem.Offset); err != nil {
+		return false, fmt.Errorf("read ltx page: %w", err)
+	}
+	pageHdr, page, err := ltx.DecodePageData(b)
+	if err != nil {
+		return false, fmt.Errorf("decode ltx page: %w", err)
+	}
+	if pageHdr.Pgno != pgno || !bytes.Equal(data, page) {
+		return false, nil
+	}
+	db.lastLTXPage = &verifiedLTXPage{header: hdr, pgno: pgno, data: bytes.Clone(page)}
+	return true, nil
+}
+
+func readLocalPageIndex(f *os.File) (map[uint32]ltx.PageIndexElem, int64, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, 0, err
+	}
+	footer := fi.Size() - ltx.TrailerSize - 8
+	if footer < ltx.HeaderSize {
+		return nil, 0, fmt.Errorf("ltx file too short to contain a page index: %d bytes", fi.Size())
+	}
+	var size [8]byte
+	if _, err := f.ReadAt(size[:], footer); err != nil {
+		return nil, 0, err
+	}
+	start := footer - int64(binary.BigEndian.Uint64(size[:]))
+	if start < ltx.HeaderSize || start > footer {
+		return nil, 0, fmt.Errorf("ltx page index size %d does not fit a %d-byte file", binary.BigEndian.Uint64(size[:]), fi.Size())
+	}
+	index, err := ltx.DecodePageIndex(bufio.NewReader(io.NewSectionReader(f, start, footer+8-start)), 0, 0, 0)
+	return index, start, err
 }
 
 // detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint
