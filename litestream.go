@@ -6,13 +6,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/superfly/ltx"
+	"google.golang.org/api/googleapi"
 	_ "modernc.org/sqlite"
 )
 
@@ -100,6 +103,24 @@ func NewLTXError(op, path string, level int, minTXID, maxTXID uint64, err error)
 // failures and must not be silently ignored.
 func isShutdownError(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+}
+
+func isRefused(err error) bool {
+	var (
+		code   int
+		status interface{ HTTPStatusCode() int }
+		azure  *azcore.ResponseError
+		google *googleapi.Error
+	)
+	switch {
+	case errors.As(err, &status):
+		code = status.HTTPStatusCode()
+	case errors.As(err, &azure):
+		code = azure.StatusCode
+	case errors.As(err, &google):
+		code = google.Code
+	}
+	return code == http.StatusUnauthorized || code == http.StatusForbidden
 }
 
 // SQLite WAL constants.
