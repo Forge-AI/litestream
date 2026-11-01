@@ -3745,7 +3745,7 @@ func TestApplySyncResult(t *testing.T) {
 		db.maxLTXFileInfos.Lock()
 		got := db.maxLTXFileInfos.m[0]
 		db.maxLTXFileInfos.Unlock()
-		if got != info {
+		if got == nil || *got != *info {
 			t.Fatalf("l0FileInfo=%v, want %v", got, info)
 		}
 	})
