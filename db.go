@@ -106,6 +106,9 @@ type DB struct {
 	// inject filesystem errors such as ENOSPC.
 	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
 
+	owe        func(level int)
+	registered bool
+
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
@@ -416,6 +419,7 @@ func NewDB(path string) *DB {
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
+	db.owe = func(int) {}
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
@@ -2312,10 +2316,15 @@ func (db *DB) applySyncResult(state *syncState, result syncResult) {
 		db.pos.Unlock()
 	}
 	if result.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		db.maxLTXFileInfos.m[0] = result.l0FileInfo
-		db.maxLTXFileInfos.Unlock()
+		db.wroteL0(*result.l0FileInfo)
 	}
+}
+
+func (db *DB) wroteL0(info ltx.FileInfo) {
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m[0] = &info
+	db.maxLTXFileInfos.Unlock()
+	db.owe(SnapshotLevel)
 }
 
 func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
@@ -2363,10 +2372,7 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 	}
 
 	if exec.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		info := *exec.l0FileInfo
-		db.maxLTXFileInfos.m[0] = &info
-		db.maxLTXFileInfos.Unlock()
+		db.wroteL0(*exec.l0FileInfo)
 	}
 
 	db.mu.Lock()
@@ -2867,10 +2873,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 	db.pos.value = &pos
 	db.pos.Unlock()
 	if exec.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		info := *exec.l0FileInfo
-		db.maxLTXFileInfos.m[0] = &info
-		db.maxLTXFileInfos.Unlock()
+		db.wroteL0(*exec.l0FileInfo)
 	}
 	return nil
 }
@@ -3354,6 +3357,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if err := db.nameCompacted(info); err != nil {
 		return info, err
 	}
+	db.owe(dstLevel + 1)
 
 	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
@@ -3361,6 +3365,9 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 			// Don't log context cancellation errors during shutdown
 			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
+			}
+			if !isShutdownError(ctx, err) && !isRefused(err) {
+				db.owe(0)
 			}
 		}
 	}
@@ -3589,6 +3596,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		if keyed && processedAll {
 			db.settleL0Retention(key)
 		}
+		if !processedAll {
+			db.owe(0)
+		}
 		return nil
 	}
 
@@ -3613,6 +3623,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	if keyed && processedAll {
 		db.settleL0Retention(key)
+	}
+	if !processedAll {
+		db.owe(0)
 	}
 	return nil
 }
