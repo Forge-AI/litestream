@@ -117,6 +117,8 @@ type ReplicaClient struct {
 	PutObjectContentMD5 bool
 	StorageClass        string
 
+	MaxAttempts int
+
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 5)
@@ -389,13 +391,18 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return err
 	}
 
+	attempts := c.MaxAttempts
+	if attempts == 0 {
+		attempts = transportRetryMaxAttempts
+	}
+
 	// Look up region if not specified and no endpoint is used.
 	// Endpoints are typically used for non-S3 object stores and do not
 	// necessarily require a region.
 	region := c.Region
 	if region == "" {
 		if c.Endpoint == "" {
-			if region, err = c.findBucketRegion(ctx, c.Bucket); err != nil {
+			if region, err = c.findBucketRegion(ctx, c.Bucket, attempts); err != nil {
 				return fmt.Errorf("s3: cannot lookup bucket region: %w", err)
 			}
 		} else {
@@ -415,7 +422,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(func() aws.Retryer { return newTransportRetryer(attempts) }),
 	}
 
 	// Add HTTP client with proper timeout
@@ -592,9 +599,9 @@ const transportRetryMaxAttempts = 8
 // successful responses, so a sustained provider flap drains it to zero and
 // every subsequent operation fails fast ("retry quota exceeded, 0 available")
 // precisely when retrying matters most for a replication tool.
-func newTransportRetryer() aws.Retryer {
+func newTransportRetryer(attempts int) aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
-		o.MaxAttempts = transportRetryMaxAttempts
+		o.MaxAttempts = attempts
 		o.MaxBackoff = time.Second
 		o.RateLimiter = ratelimit.None
 		// S3-compatible providers (observed: Tigris) load-shed with HTTP 408
@@ -628,10 +635,10 @@ func (c *ReplicaClient) credentialsProvider() aws.CredentialsProvider {
 }
 
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
-func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string, attempts int) (string, error) {
 	// Build a config with credentials but no region
 	configOpts := []func(*config.LoadOptions) error{
-		config.WithRetryer(newTransportRetryer),
+		config.WithRetryer(func() aws.Retryer { return newTransportRetryer(attempts) }),
 	}
 
 	// Add static credentials if provided

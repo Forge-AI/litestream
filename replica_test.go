@@ -3225,3 +3225,43 @@ func (c *rendezvousOpenClient) OpenLTXFile(ctx context.Context, level int, minTX
 	}
 	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 }
+
+func TestReplica_Restore_ReportsRisingByteCountsEndingAtTheImageSize(t *testing.T) {
+	ctx := context.Background()
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (x BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 768) INSERT INTO t SELECT randomblob(4096) FROM n`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncAndWait(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	var reported []int64
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	if err := litestream.NewReplicaWithClient(nil, db.Replica.Client).Restore(ctx, litestream.RestoreOptions{
+		OutputPath: restored,
+		Progress:   func(restoredBytes int64) { reported = append(reported, restoredBytes) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reported) < 2 {
+		t.Fatalf("restore of %d bytes reported %v, want a report at its first write and one at the end", info.Size(), reported)
+	}
+	for i := 1; i < len(reported); i++ {
+		if reported[i] < reported[i-1] {
+			t.Fatalf("report %d fell from %d to %d bytes", i, reported[i-1], reported[i])
+		}
+	}
+	if last := reported[len(reported)-1]; last != info.Size() {
+		t.Fatalf("the last report reads %d bytes, want the restored image's %d", last, info.Size())
+	}
+}

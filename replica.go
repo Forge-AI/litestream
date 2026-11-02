@@ -755,7 +755,7 @@ func (r *Replica) restore(ctx context.Context, opt RestoreOptions, restoredTXID 
 
 	targetTXID := infos[len(infos)-1].MaxTXID
 	for attempt := 0; ; attempt++ {
-		err := r.restorePlan(ctx, f, infos)
+		err := r.restorePlan(ctx, f, infos, opt.Progress)
 		if err == nil {
 			break
 		}
@@ -894,7 +894,7 @@ func newRestoreCompactor(w io.Writer, rdrs []io.Reader) (*ltx.Compactor, error) 
 	return c, nil
 }
 
-func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.FileInfo) error {
+func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.FileInfo, progress func(restoredBytes int64)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
@@ -944,10 +944,37 @@ func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.File
 		}
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
-	if err := ltx.NewDecoder(pr).DecodeDatabaseTo(f); err != nil {
+	restored := &restoreProgress{w: f, report: progress}
+	if err := ltx.NewDecoder(pr).DecodeDatabaseTo(restored); err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}
+	restored.reported()
 	return nil
+}
+
+const restoreProgressInterval = 100 * time.Millisecond
+
+type restoreProgress struct {
+	w       io.Writer
+	report  func(restoredBytes int64)
+	written int64
+	last    time.Time
+}
+
+func (p *restoreProgress) Write(b []byte) (int, error) {
+	n, err := p.w.Write(b)
+	p.written += int64(n)
+	if time.Since(p.last) >= restoreProgressInterval {
+		p.reported()
+	}
+	return n, err
+}
+
+func (p *restoreProgress) reported() {
+	p.last = time.Now()
+	if p.report != nil {
+		p.report(p.written)
+	}
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and

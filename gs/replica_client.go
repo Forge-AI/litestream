@@ -47,6 +47,7 @@ type ReplicaClient struct {
 	Bucket      string
 	Path        string
 	Credentials litestream.CredentialSource
+	MaxAttempts int
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -97,6 +98,9 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 	if c.client, err = storage.NewClient(context.WithoutCancel(ctx), opts...); err != nil {
 		return fmt.Errorf("failed to create GCS client (bucket: %s): %w", c.Bucket, err)
+	}
+	if c.MaxAttempts != 0 {
+		c.client.SetRetry(storage.WithMaxAttempts(c.MaxAttempts))
 	}
 	c.bkt = c.client.Bucket(c.Bucket)
 

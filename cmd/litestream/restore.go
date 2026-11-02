@@ -14,11 +14,20 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/abs"
+	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/s3"
 )
 
 // RestoreCommand represents a command to restore a database from a backup.
 type RestoreCommand struct{}
+
+type restoreProgressLine struct {
+	Level         string `json:"level"`
+	Msg           string `json:"msg"`
+	RestoredBytes int64  `json:"restored_bytes"`
+}
 
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
@@ -60,6 +69,10 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 			slog.Warn("-parallelism is deprecated and has no effect; accepted for compatibility only")
 		}
 	})
+	progress := json.NewEncoder(os.Stderr)
+	opt.Progress = func(restoredBytes int64) {
+		_ = progress.Encode(restoreProgressLine{Level: "INFO", Msg: "restore progress", RestoredBytes: restoredBytes})
+	}
 
 	// When follow mode is enabled, set up signal handling so Ctrl+C stops
 	// the follow loop cleanly.
@@ -325,8 +338,22 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if err != nil {
 		return nil, err
 	}
+	failFast(r)
 	_, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
+}
+
+const restoreMaxAttempts = 3
+
+func failFast(r *litestream.Replica) {
+	switch client := r.Client.(type) {
+	case *s3.ReplicaClient:
+		client.MaxAttempts = restoreMaxAttempts
+	case *abs.ReplicaClient:
+		client.MaxAttempts = restoreMaxAttempts
+	case *gs.ReplicaClient:
+		client.MaxAttempts = restoreMaxAttempts
+	}
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
@@ -349,6 +376,7 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 	if err != nil {
 		return nil, err
 	}
+	failFast(db.Replica)
 
 	// Restore into original database path if not specified.
 	if opt.OutputPath == "" {
