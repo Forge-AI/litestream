@@ -2945,7 +2945,7 @@ func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 // 5 requested") and Litestream stopped retrying exactly when retries mattered.
 // The bucket only refills on success, so 100+ consecutive failures starve it.
 func TestTransportRetryer_SurvivesSustainedFailures(t *testing.T) {
-	retryer := newTransportRetryer()
+	retryer := newTransportRetryer(transportRetryMaxAttempts)
 
 	if got := retryer.MaxAttempts(); got != transportRetryMaxAttempts {
 		t.Fatalf("MaxAttempts() = %d, want %d", got, transportRetryMaxAttempts)
@@ -2998,7 +2998,7 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 // (observed from Tigris during soak testing). The SDK defaults treat neither
 // as retryable, so restores failed after effectively zero patience.
 func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
-	retryer := newTransportRetryer()
+	retryer := newTransportRetryer(transportRetryMaxAttempts)
 
 	status408 := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusRequestTimeout}}, Err: fmt.Errorf("request timeout")}
 	if !retryer.IsErrorRetryable(status408) {
@@ -3294,7 +3294,7 @@ func TestReplicaClient_PutObjectContentMD5OtherOperations(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Run("Region", func(t *testing.T) {
-				region, err := client.findBucketRegion(ctx, client.Bucket)
+				region, err := client.findBucketRegion(ctx, client.Bucket, transportRetryMaxAttempts)
 				if fail {
 					if err == nil {
 						t.Fatal("expected region error")
@@ -3427,7 +3427,7 @@ func TestTransportRetryer_Throttling(t *testing.T) {
 		{name: "AccessDenied", status: http.StatusForbidden, code: "AccessDenied"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			retryer := newTransportRetryer()
+			retryer := newTransportRetryer(transportRetryMaxAttempts)
 			err := &smithy.OperationError{ServiceID: "S3", OperationName: "ListObjectsV2", Err: &smithyhttp.ResponseError{
 				Response: &smithyhttp.Response{Response: &http.Response{StatusCode: tt.status}},
 				Err:      &smithy.GenericAPIError{Code: tt.code, Message: "Reduce your request rate"},
