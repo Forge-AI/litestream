@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -576,5 +577,23 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
 			t.Fatalf("page %d data mismatch", i+1)
 		}
+	}
+}
+
+func TestRestoreProgress_ReportsAWriteOnceTheIntervalHasPassed(t *testing.T) {
+	var reported []int64
+	p := &restoreProgress{w: io.Discard, report: func(restoredBytes int64) { reported = append(reported, restoredBytes) }}
+	page := make([]byte, 4096)
+
+	for _, wait := range []time.Duration{0, 0, restoreProgressInterval + 20*time.Millisecond} {
+		time.Sleep(wait)
+		if _, err := p.Write(page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.reported()
+
+	if len(reported) < 3 || reported[0] != 4096 || !slices.Equal(reported[len(reported)-2:], []int64{12288, 12288}) {
+		t.Fatalf("reported %v, want the first write first, then the write after the interval and the end at 12288", reported)
 	}
 }

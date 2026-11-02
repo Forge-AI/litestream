@@ -3861,6 +3861,8 @@ type RestoreOptions struct {
 	// IntegrityCheck specifies the level of integrity checking after restore.
 	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
 	IntegrityCheck IntegrityCheckMode
+
+	Progress func(restoredBytes int64)
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.

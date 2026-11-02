@@ -6,9 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -391,5 +394,46 @@ func TestRestoreCommand_ParallelismDeprecated(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestRestoreCommand_RunGivesUpOnADeadBucketAfterThreeCalls(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		conn, _, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	t.Cleanup(server.Close)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.sqlite")
+	configPath := filepath.Join(dir, "litestream.yml")
+	config := fmt.Sprintf(`dbs:
+  - path: %s
+    replica:
+      type: s3
+      bucket: test-bucket
+      path: replica
+      endpoint: %s
+      region: us-east-1
+      force-path-style: true
+      access-key-id: test-key
+      secret-access-key: test-secret
+`, dbPath, server.URL)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := (&RestoreCommand{}).Run(context.Background(), []string{"-no-expand-env", "-config", configPath, "-o", filepath.Join(dir, "restored.sqlite"), dbPath})
+
+	if err == nil {
+		t.Fatal("a restore from a bucket that drops every connection succeeded")
+	}
+	if got := calls.Load(); got != 3 {
+		t.Fatalf("the restore made %d bucket calls, want one call's 3 attempts", got)
 	}
 }

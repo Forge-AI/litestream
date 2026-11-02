@@ -58,6 +58,8 @@ type ReplicaClient struct {
 	// Azure Blob Storage container information
 	Bucket string
 	Path   string
+
+	MaxAttempts int
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -122,11 +124,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
 	}
 
+	retries := int32(10)
+	if c.MaxAttempts != 0 {
+		retries = int32(c.MaxAttempts - 1)
+	}
+
 	// Configure client options with retry policy
 	clientOptions := &azblob.ClientOptions{
 		ClientOptions: azcore.ClientOptions{
 			Retry: policy.RetryOptions{
-				MaxRetries:    10,
+				MaxRetries:    retries,
 				RetryDelay:    time.Second,
 				MaxRetryDelay: 30 * time.Second,
 				TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
