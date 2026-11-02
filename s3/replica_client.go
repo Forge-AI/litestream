@@ -466,7 +466,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
 			o.UseARNRegion = true
-			o.HTTPSignerV4 = unsignedRangeSigner{v4.NewSigner()}
+			o.HTTPSignerV4 = &unsignedRangeSigner{Signer: v4.NewSigner()}
 			// Add User-Agent and optional middleware.
 			o.APIOptions = append(o.APIOptions, c.middlewareOption())
 		},
@@ -764,12 +764,23 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 type unsignedRangeSigner struct {
 	*v4.Signer
+	mu              sync.Mutex
+	accessKeyID     string
+	secretAccessKey string
 }
 
-func (s unsignedRangeSigner) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash, service, region string, at time.Time, options ...func(*v4.SignerOptions)) error {
+func (s *unsignedRangeSigner) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash, service, region string, at time.Time, options ...func(*v4.SignerOptions)) error {
+	s.mu.Lock()
+	if s.accessKeyID != credentials.AccessKeyID || s.secretAccessKey != credentials.SecretAccessKey {
+		s.Signer = v4.NewSigner()
+		s.accessKeyID = credentials.AccessKeyID
+		s.secretAccessKey = credentials.SecretAccessKey
+	}
+	signer := s.Signer
+	s.mu.Unlock()
 	rangeValue := req.Header.Get("Range")
 	req.Header.Del("Range")
-	err := s.Signer.SignHTTP(ctx, credentials, req, payloadHash, service, region, at, options...)
+	err := signer.SignHTTP(ctx, credentials, req, payloadHash, service, region, at, options...)
 	if rangeValue != "" {
 		req.Header.Set("Range", rangeValue)
 	}
