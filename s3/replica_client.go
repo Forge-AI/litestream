@@ -457,6 +457,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
+			o.HTTPSignerV4 = &rotatingSigner{Signer: v4.NewSigner()}
 			o.UseARNRegion = true
 			// Add User-Agent and optional middleware.
 			o.APIOptions = append(o.APIOptions, c.middlewareOption())
@@ -632,6 +633,25 @@ func (c *ReplicaClient) credentialsProvider() aws.CredentialsProvider {
 		return credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, c.SessionToken)
 	}
 	return nil
+}
+
+type rotatingSigner struct {
+	*v4.Signer
+	mu              sync.Mutex
+	accessKeyID     string
+	secretAccessKey string
+}
+
+func (s *rotatingSigner) SignHTTP(ctx context.Context, credentials aws.Credentials, req *http.Request, payloadHash, service, region string, at time.Time, options ...func(*v4.SignerOptions)) error {
+	s.mu.Lock()
+	if s.accessKeyID != credentials.AccessKeyID || s.secretAccessKey != credentials.SecretAccessKey {
+		s.Signer = v4.NewSigner()
+		s.accessKeyID = credentials.AccessKeyID
+		s.secretAccessKey = credentials.SecretAccessKey
+	}
+	signer := s.Signer
+	s.mu.Unlock()
+	return signer.SignHTTP(ctx, credentials, req, payloadHash, service, region, at, options...)
 }
 
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
