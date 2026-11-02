@@ -261,11 +261,21 @@ type syncState struct {
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
 
-	handoverTXID ltx.TXID
+	handover Handover
+}
+
+type Handover struct {
+	TXID ltx.TXID
+	WAL  WALEnd
+}
+
+type WALEnd struct {
+	Salt   uint64 `json:"salt" yaml:"salt"`
+	Frames uint32 `json:"frames" yaml:"frames"`
 }
 
 type handoverClaim struct {
-	txid  ltx.TXID
+	claim Handover
 	proof *HandoverProof
 }
 
@@ -274,16 +284,16 @@ type HandoverProof struct {
 	TXID      uint64 `json:"txid"`
 }
 
-func (db *DB) SetHandover(txid ltx.TXID) {
+func (db *DB) SetHandover(claim Handover) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	db.handover = handoverClaim{txid: txid}
+	db.handover = handoverClaim{claim: claim}
 }
 
 func (db *DB) HandoverClaimed() bool {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.handover.txid != 0 || db.handover.proof != nil
+	return db.handover.claim.TXID != 0 || db.handover.proof != nil
 }
 
 func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
@@ -297,7 +307,7 @@ func (db *DB) ProveHandover(ctx context.Context) (HandoverProof, error) {
 		err = fmt.Errorf("prove hand-over: database file missing: %s", db.path)
 	}
 	if err != nil {
-		db.SetHandover(0)
+		db.SetHandover(Handover{})
 		return HandoverProof{}, err
 	}
 	db.applySyncExecutor(exec, false)
@@ -706,7 +716,7 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.invalidatePosCache()
 
 	db.mu.Lock()
-	db.syncState.handoverTXID = 0
+	db.syncState.handover = Handover{}
 	db.handover = handoverClaim{}
 	db.mu.Unlock()
 
@@ -1035,7 +1045,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.f = nil
 	db.opened = false
 	db.rtx = nil
-	db.syncState.handoverTXID = 0
+	db.syncState.handover = Handover{}
 	db.handover = handoverClaim{}
 	db.mu.Unlock()
 
@@ -2013,11 +2023,11 @@ func (db *DB) verify(ctx context.Context, state *syncState) (info syncInfo, err 
 
 func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncInfo, error) {
 	info, err := db.verifyWAL(ctx, exec)
-	if err != nil || !info.snapshotting || exec.state.handoverTXID == 0 {
+	if err != nil || !info.snapshotting || exec.state.handover.TXID == 0 {
 		return info, err
 	}
-	if exec.pos.TXID != exec.state.handoverTXID {
-		exec.state.handoverTXID = 0
+	if exec.pos.TXID != exec.state.handover.TXID {
+		exec.state.handover = Handover{}
 		return info, nil
 	}
 
@@ -2025,8 +2035,12 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncI
 	if err != nil {
 		return info, fmt.Errorf("read wal header after hand-over: %w", err)
 	}
+	offset := int64(WALHeaderSize)
+	if end := exec.state.handover.WAL; binary.BigEndian.Uint64(hdr[16:]) == end.Salt {
+		offset += int64(end.Frames) * int64(db.pageSize+WALFrameHeaderSize)
+	}
 	return syncInfo{
-		offset:              WALHeaderSize,
+		offset:              offset,
 		salt1:               binary.BigEndian.Uint32(hdr[16:]),
 		salt2:               binary.BigEndian.Uint32(hdr[20:]),
 		prevCommit:          info.prevCommit,
@@ -2310,7 +2324,7 @@ func (db *DB) applySyncResult(state *syncState, result syncResult) {
 	state.lastSyncedWALOffset = result.newWALSize
 	state.syncedToWALEnd = result.syncedToWALEnd
 	if result.pos != nil {
-		state.handoverTXID = 0
+		state.handover = Handover{}
 		db.pos.Lock()
 		db.pos.value = result.pos
 		db.pos.Unlock()
@@ -2342,10 +2356,10 @@ func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
 		return nil, fmt.Errorf("pos: %w", err)
 	}
 
-	if claimed := db.handover.txid; claimed != 0 {
-		proof := HandoverProof{Continued: pos.TXID == claimed, TXID: uint64(pos.TXID)}
+	if claimed := db.handover.claim; claimed.TXID != 0 {
+		proof := HandoverProof{Continued: pos.TXID == claimed.TXID, TXID: uint64(pos.TXID)}
 		if proof.Continued {
-			db.syncState.handoverTXID = claimed
+			db.syncState.handover = claimed
 		}
 		db.handover = handoverClaim{proof: &proof}
 	}
@@ -2390,7 +2404,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 	if result.pos != nil {
 		exec.pos = *result.pos
 		exec.posChanged = true
-		exec.state.handoverTXID = 0
+		exec.state.handover = Handover{}
 	}
 	if result.l0FileInfo != nil {
 		info := *result.l0FileInfo

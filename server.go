@@ -203,9 +203,9 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	if db.IsOpen() {
 		status = "already_running"
 	} else {
-		db.SetHandover(ltx.TXID(req.HandoverTXID))
+		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
-			db.SetHandover(0)
+			db.SetHandover(Handover{})
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 			return
 		}
@@ -378,6 +378,7 @@ type StartRequest struct {
 	Path         string `json:"path"`
 	Timeout      int    `json:"timeout,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	HandoverWAL  WALEnd `json:"handover_wal"`
 }
 
 // StartResponse is the response body for the /start endpoint.
@@ -573,6 +574,7 @@ type RegisterDatabaseRequest struct {
 	Path              string `json:"path"`
 	ReplicaURL        string `json:"replica_url"`
 	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
+	HandoverWAL       WALEnd `json:"handover_wal"`
 	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
 	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
 }
@@ -585,6 +587,7 @@ type RegisterDrivenRequest struct {
 	Path         string `json:"path"`
 	ReplicaURL   string `json:"replica_url"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	HandoverWAL  WALEnd `json:"handover_wal"`
 	Retention    *bool  `json:"retention,omitempty"`
 }
 
@@ -650,7 +653,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Create new database.
 	db := NewDB(expandedPath)
 	if req.HandoverTXID != 0 {
-		db.SetHandover(ltx.TXID(req.HandoverTXID))
+		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 	}
 
 	if req.MonitorIntervalMS > 0 {
@@ -736,7 +739,7 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 		db.RetentionEnabled = *req.Retention
 	}
 	if req.HandoverTXID != 0 {
-		db.SetHandover(ltx.TXID(req.HandoverTXID))
+		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 	}
 	replica := NewReplica(db)
 	replica.Client = client
