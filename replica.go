@@ -167,15 +167,6 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	}
 	defer r.syncSem.Release(1)
 
-	// Clear last position if if an error occurs during sync.
-	defer func() {
-		if err != nil {
-			r.mu.Lock()
-			r.pos = ltx.Pos{}
-			r.mu.Unlock()
-		}
-	}()
-
 	if err := ctx.Err(); err != nil {
 		return result, context.Cause(ctx)
 	}
@@ -528,6 +519,8 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 			continue
 		}
+
+		r.db.pay(ctx)
 
 		// Success - reset backoff and error counter.
 		if consecutiveErrs > 0 {

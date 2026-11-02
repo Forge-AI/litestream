@@ -110,8 +110,7 @@ type Store struct {
 	cancel func()
 	done   <-chan struct{}
 
-	owed  map[int]map[*DB]struct{}
-	wakes map[int]chan struct{}
+	owed map[int]map[*DB]struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -123,7 +122,8 @@ type Store struct {
 	// How often to check for expired L0 files.
 	L0RetentionCheckInterval time.Duration
 
-	// If true, compaction is run in the background according to compaction levels.
+	// If true, each replica sync pays the compactions, snapshot and retention
+	// its database owes once their level is due.
 	CompactionMonitorEnabled bool
 
 	// If true, verify TXID consistency at destination level after each compaction.
@@ -170,15 +170,14 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
 		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
 		owed:                     map[int]map[*DB]struct{}{SnapshotLevel: {}},
-		wakes:                    map[int]chan struct{}{SnapshotLevel: make(chan struct{}, 1)},
 	}
 	for _, lvl := range levels {
 		s.owed[lvl.Level] = map[*DB]struct{}{}
-		s.wakes[lvl.Level] = make(chan struct{}, 1)
 	}
 
 	for _, db := range dbs {
 		db.owe = s.ower(db)
+		db.pay = func(ctx context.Context) { s.pay(ctx, db) }
 		db.registered = true
 		db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 		db.L0Retention = s.L0Retention
@@ -235,43 +234,6 @@ func (s *Store) Open(ctx context.Context) error {
 	if err := openGroup.Wait(); err != nil {
 		return err
 	}
-	for _, db := range s.dbs {
-		for level := range s.owed {
-			s.owe(db, level)
-		}
-	}
-
-	// Start monitors for compactions & snapshots.
-	if s.CompactionMonitorEnabled {
-		// Start compaction monitors for all levels except L0.
-		for _, lvl := range s.levels {
-			lvl := lvl
-			if lvl.Level == 0 {
-				continue
-			}
-
-			s.wg.Add(1)
-			go func() {
-				defer s.wg.Done()
-				s.monitorCompactionLevel(s.ctx, lvl)
-			}()
-		}
-
-		// Start snapshot monitor for snapshots.
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.monitorCompactionLevel(s.ctx, s.SnapshotLevel())
-		}()
-	}
-
-	if s.L0Retention > 0 && s.L0RetentionCheckInterval > 0 {
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.monitorL0Retention(s.ctx)
-		}()
-	}
 
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
@@ -289,8 +251,8 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	// Stop the compaction, snapshot & retention monitors before closing the
-	// databases so no snapshot is still reading a database's file handle.
+	// Stop the store's monitors before closing the databases. Each database's
+	// Close cancels the compactions, snapshots and retention its syncs pay.
 	s.cancel()
 	s.wg.Wait()
 
@@ -337,6 +299,7 @@ func (s *Store) RegisterDB(db *DB) error {
 
 	// Apply store-wide settings before opening the database.
 	db.owe = s.ower(db)
+	db.pay = func(ctx context.Context) { s.pay(ctx, db) }
 	db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
@@ -420,54 +383,80 @@ func (s *Store) ower(db *DB) func(level int) {
 
 func (s *Store) owe(db *DB, level int) {
 	s.mu.Lock()
-	owed, ok := s.owed[level]
-	ok = ok && db.registered
-	if ok {
+	defer s.mu.Unlock()
+	if owed, ok := s.owed[level]; ok && db.registered {
 		owed[db] = struct{}{}
-	}
-	s.mu.Unlock()
-	if !ok {
-		return
-	}
-	select {
-	case s.wakes[level] <- struct{}{}:
-	default:
 	}
 }
 
-func (s *Store) takeOwed(level int) []*DB {
+func (s *Store) takeOwed(db *DB) CompactionLevels {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	owed := make([]*DB, 0, len(s.owed[level]))
-	for db := range s.owed[level] {
-		owed = append(owed, db)
-		delete(s.owed[level], db)
+	var owed CompactionLevels
+	for _, lvl := range append(slices.Clone(s.levels), s.SnapshotLevel()) {
+		if _, ok := s.owed[lvl.Level][db]; ok {
+			delete(s.owed[lvl.Level], db)
+			owed = append(owed, lvl)
+		}
 	}
 	return owed
 }
 
-func (s *Store) awaitOwed(ctx context.Context, level int, at func(time.Time) time.Time) bool {
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-s.wakes[level]:
-		}
-		s.mu.Lock()
-		owed := len(s.owed[level]) > 0
-		s.mu.Unlock()
-		if !owed {
-			continue
-		}
-		timer := time.NewTimer(time.Until(at(time.Now())))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return false
-		case <-timer.C:
-			return true
+func (s *Store) pay(ctx context.Context, db *DB) {
+	if !s.CompactionMonitorEnabled {
+		return
+	}
+	db.paying.Lock()
+	defer db.paying.Unlock()
+	var kept CompactionLevels
+	for owed := s.takeOwed(db); len(owed) > 0; owed = s.takeOwed(db) {
+		for _, lvl := range owed {
+			if s.payLevel(ctx, db, lvl) {
+				kept = append(kept, lvl)
+			}
 		}
 	}
+	for _, lvl := range kept {
+		s.owe(db, lvl.Level)
+	}
+}
+
+func (s *Store) payLevel(ctx context.Context, db *DB, lvl *CompactionLevel) (stillOwed bool) {
+	if !db.IsOpen() {
+		return false
+	}
+	_, err := s.CompactDB(ctx, db, lvl)
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrCompactionTooEarly):
+		return true
+	case errors.Is(err, ErrNoCompaction):
+		db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+		return false
+	case errors.Is(err, ErrDBNotReady):
+		db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
+		return false
+	case isRefused(err):
+		db.Logger.Warn("compaction refused; the next write retries it", "level", lvl.Level, "error", err)
+		return false
+	case isShutdownError(ctx, err):
+		return false
+	default:
+		db.Logger.Error("compaction failed; the next sync retries it", "level", lvl.Level, "error", err)
+		return true
+	}
+	if lvl.Level != SnapshotLevel {
+		return false
+	}
+	err = s.EnforceSnapshotRetention(ctx, db)
+	switch {
+	case err == nil, isShutdownError(ctx, err):
+	case isRefused(err):
+		db.Logger.Warn("snapshot retention refused; the next snapshot retries it", "error", err)
+	default:
+		db.Logger.Error("retention enforcement failed; the next snapshot retries it", "error", err)
+	}
+	return false
 }
 
 // EnableDB starts replication for a registered database.
@@ -657,67 +646,6 @@ func (s *Store) SnapshotLevel() *CompactionLevel {
 	return &CompactionLevel{
 		Level:    SnapshotLevel,
 		Interval: s.SnapshotInterval,
-	}
-}
-
-func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
-	s.Logger.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
-
-	for s.awaitOwed(ctx, lvl.Level, lvl.NextCompactionAt) {
-		for _, db := range s.takeOwed(lvl.Level) {
-			if !db.IsOpen() {
-				continue // skip disabled DBs
-			}
-			_, err := s.CompactDB(ctx, db, lvl)
-			switch {
-			case errors.Is(err, ErrNoCompaction):
-				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
-			case errors.Is(err, ErrCompactionTooEarly):
-				s.owe(db, lvl.Level)
-			case errors.Is(err, ErrDBNotReady):
-				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
-			case isRefused(err):
-				db.Logger.Warn("compaction refused; the next write retries it", "level", lvl.Level, "error", err)
-				continue
-			case err != nil && !isShutdownError(ctx, err):
-				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
-				s.owe(db, lvl.Level)
-			}
-
-			if lvl.Level == SnapshotLevel {
-				err := s.EnforceSnapshotRetention(ctx, db)
-				switch {
-				case err == nil, isShutdownError(ctx, err):
-				case isRefused(err):
-					db.Logger.Warn("snapshot retention refused; the next write retries it", "error", err)
-				default:
-					db.Logger.Error("retention enforcement failed", "error", err)
-					s.owe(db, lvl.Level)
-				}
-			}
-		}
-	}
-}
-
-func (s *Store) monitorL0Retention(ctx context.Context) {
-	s.Logger.Info("starting L0 retention monitor", "interval", s.L0RetentionCheckInterval, "retention", s.L0Retention)
-
-	after := func(now time.Time) time.Time { return now.Add(s.L0RetentionCheckInterval) }
-	for s.awaitOwed(ctx, 0, after) {
-		for _, db := range s.takeOwed(0) {
-			if !db.IsOpen() {
-				continue // skip disabled DBs
-			}
-			err := db.EnforceL0RetentionByTime(ctx)
-			switch {
-			case err == nil, isShutdownError(ctx, err):
-			case isRefused(err):
-				db.Logger.Warn("l0 retention refused; the next write retries it", "path", db.Path(), "error", err)
-			default:
-				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
-				s.owe(db, 0)
-			}
-		}
 	}
 }
 
