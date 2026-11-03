@@ -163,6 +163,28 @@ func dropAndIdle(t *testing.T, n int) int64 {
 	return calls()
 }
 
+func TestStore_EachSyncDrivenWriteUploadsOneLTXFileAndSyncsOnce(t *testing.T) {
+	store := NewStore(nil, CompactionLevels{{Level: 0}})
+	db := registerCounted(t, store, t.TempDir(), "drafts")
+	t.Cleanup(func() {
+		_ = db.app.Close()
+		_ = store.UnregisterDB(context.Background(), db.path)
+	})
+	db.write(t, store, 0)
+	registered := store.FindDB(db.path)
+	uploaded, synced := db.client.writes.Load(), idleWork([]*DB{registered}).syncs
+	const writes = 20
+	for i := 1; i <= writes; i++ {
+		db.write(t, store, i)
+	}
+	if uploads := db.client.writes.Load() - uploaded; uploads != writes {
+		t.Errorf("%d writes, each followed by a sync, uploaded %d LTX files, want %d: one per write and none for checkpoint bookkeeping", writes, uploads, writes)
+	}
+	if syncs := idleWork([]*DB{registered}).syncs - synced; syncs != writes {
+		t.Errorf("%d writes, each followed by a sync, ran %v syncs, want %d", writes, syncs, writes)
+	}
+}
+
 func TestServer_ASyncWhoseUploadIsRefusedAnswersForbidden(t *testing.T) {
 	store := NewStore(nil, CompactionLevels{{Level: 0}})
 	db := registerCounted(t, store, t.TempDir(), "refused")
