@@ -1825,8 +1825,16 @@ type ltxStagingFile interface {
 	Close() error
 }
 
+type fsyncedLTXFile struct{ *os.File }
+
+func (f fsyncedLTXFile) Sync() error { return internal.Fsync(f.File) }
+
 func defaultOpenLTXFile(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
-	return os.OpenFile(name, flag, perm)
+	f, err := os.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, err
+	}
+	return fsyncedLTXFile{f}, nil
 }
 
 // walFileSize returns the size of the WAL file in bytes.
@@ -1862,6 +1870,58 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	return db.bumpLitestreamSeq(ctx)
 }
 
+func (db *DB) recoversFrom(err error) bool {
+	var ltxErr *LTXError
+	return db.Replica.AutoRecoverEnabled && errors.As(err, &ltxErr) && ltxErr.IsAutoRecoverable()
+}
+
+// discardUploadFiles deletes the local upload files so the database takes the
+// baseline a restored database takes. Files the replica already holds are not
+// lost, and the next sync uploads a snapshot of the rest.
+func (db *DB) discardUploadFiles(cause error) (ltx.Pos, error) {
+	db.Logger.Warn("auto-recovery enabled, resetting local state", "error", cause)
+	if err := os.RemoveAll(db.LTXDir()); err != nil {
+		return ltx.Pos{}, fmt.Errorf("remove ltx directory: %w", err)
+	}
+	db.invalidatePosCache()
+	return ltx.Pos{}, nil
+}
+
+// verifyUploadFiles checks every local upload file, since uploading streams them
+// unread and compaction prefers them to the replica's copies. Files written after
+// this check cannot be broken by a power cut without another restart, which
+// checks them again.
+func (db *DB) verifyUploadFiles(replicated ltx.TXID) error {
+	ents, err := os.ReadDir(db.LTXLevelDir(0))
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	next := replicated + 1
+	for _, ent := range ents {
+		minTXID, maxTXID, err := ltx.ParseFilename(ent.Name())
+		if err != nil {
+			continue
+		}
+		path := db.LTXPath(0, minTXID, maxTXID)
+		if maxTXID > replicated && minTXID > next {
+			return NewLTXError("verify", db.LTXPath(0, next, next), 0, uint64(next), uint64(next), ErrLTXMissing)
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return NewLTXError("open", path, 0, uint64(minTXID), uint64(maxTXID), err)
+		}
+		err = ltx.NewDecoder(f).Verify()
+		_ = f.Close()
+		if err != nil {
+			return NewLTXError("verify", path, 0, uint64(minTXID), uint64(maxTXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+		}
+		next = max(next, maxTXID+1)
+	}
+	return nil
+}
+
 // checkDatabaseBehindReplica detects when a database has been restored to an
 // earlier state and the replica has a higher TXID. This handles issue #781.
 //
@@ -1873,7 +1933,11 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	// Get database position from local L0 files
 	dbPos, err := db.Pos()
-	if err != nil {
+	if db.recoversFrom(err) {
+		if dbPos, err = db.discardUploadFiles(err); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return fmt.Errorf("get database position: %w", err)
 	}
 
@@ -1881,7 +1945,17 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	replicaInfo, err := db.Replica.maxRestorableLTXFileInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get replica position: %w", err)
-	} else if replicaInfo.MaxTXID == 0 {
+	}
+	if db.Replica.AutoRecoverEnabled {
+		if err := db.verifyUploadFiles(replicaInfo.MaxTXID); db.recoversFrom(err) {
+			if dbPos, err = db.discardUploadFiles(err); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return fmt.Errorf("verify upload files: %w", err)
+		}
+	}
+	if replicaInfo.MaxTXID == 0 {
 		return nil // No remote replica data yet
 	}
 
@@ -1934,7 +2008,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("copy L0 file: %w", err)
 	}
 
-	if err := tmpFile.Sync(); err != nil {
+	if err := internal.Fsync(tmpFile); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("sync L0 file: %w", err)
 	}
@@ -2674,7 +2748,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.invalidatePosCache()
 		return result, fmt.Errorf("rename ltx file: %w", err)
 	}
-	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+	if err := internal.FsyncUploadDir(filepath.Dir(filename)); err != nil {
 		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
 		db.maxLTXFileInfos.Unlock()
