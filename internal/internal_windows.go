@@ -12,6 +12,14 @@ func Fileinfo(fi os.FileInfo) (uid, gid int) {
 	return -1, -1
 }
 
+func Fsync(f *os.File) error {
+	return f.Sync()
+}
+
+func FsyncUploadDir(path string) error {
+	return nil
+}
+
 func FsyncDir(path string) error {
 	return nil
 }
