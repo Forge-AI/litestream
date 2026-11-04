@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -149,6 +152,188 @@ func TestDB_BehindReplicaTakesBaselineAboveSnapshot(t *testing.T) {
 				t.Fatalf("restored applied sequence %d, want 11", seq)
 			}
 
+		})
+	}
+}
+
+type offlineClient struct {
+	litestream.ReplicaClient
+	offline atomic.Bool
+}
+
+func (c *offlineClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.offline.Load() {
+		return nil, errors.New("offline")
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func TestDB_BrokenEarlierUploadFileReuploadsFromTheReplica(t *testing.T) {
+	for name, breakFile := range map[string]func(string) error{
+		"missing": os.Remove,
+		"truncated": func(path string) error {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(path, data[:len(data)/2], 0o600)
+		},
+		"zero tail": func(path string) error {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			clear(data[len(data)/2:])
+			return os.WriteFile(path, data, 0o600)
+		},
+	} {
+		for _, pending := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s pending=%t", name, pending), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				root := t.TempDir()
+				path := filepath.Join(root, "primary.db")
+				client := &offlineClient{ReplicaClient: file.NewReplicaClient(filepath.Join(root, "remote"))}
+				c, err := sql.Open("sqlite", path)
+				mustBehind(err)
+				defer c.Close()
+				_, err = c.Exec("PRAGMA journal_mode = wal; PRAGMA wal_autocheckpoint = 0; CREATE TABLE t(x)")
+				mustBehind(err)
+				open := func(autoRecover bool) *litestream.DB {
+					db := litestream.NewDB(path)
+					db.SyncDriven = true
+					db.MonitorInterval = 0
+					db.ShutdownSyncTimeout = 0
+					db.Replica = litestream.NewReplicaWithClient(db, client)
+					db.Replica.MonitorEnabled = false
+					db.Replica.AutoRecoverEnabled = autoRecover
+					mustBehind(db.Open())
+					return db
+				}
+				insert := func(x int) {
+					_, err := c.Exec("INSERT INTO t VALUES (?)", x)
+					mustBehind(err)
+				}
+
+				before := open(false)
+				insert(1)
+				mustBehind(before.SyncAndWait(ctx))
+				_, replicated, err := before.MaxLTX()
+				mustBehind(err)
+				client.offline.Store(true)
+				insert(2)
+				mustBehind(before.Sync(ctx))
+				insert(3)
+				mustBehind(before.Sync(ctx))
+				_, newest, err := before.MaxLTX()
+				mustBehind(err)
+				if newest < replicated+2 {
+					t.Fatalf("the fixture left transactions %s to %s pending, want two", replicated+1, newest)
+				}
+				earlier := before.LTXPath(0, replicated+1, replicated+1)
+				if !pending {
+					earlier = before.LTXPath(0, replicated, replicated)
+				}
+				_ = before.Close(ctx)
+				mustBehind(breakFile(earlier))
+				client.offline.Store(false)
+
+				after := open(true)
+				defer after.Close(ctx)
+				insert(4)
+				mustBehind(after.SyncAndWait(ctx))
+				if _, err := after.Compact(ctx, 1); err != nil {
+					t.Errorf("compaction after recovery: %v", err)
+				}
+				if err := litestream.NewCompactor(client, nil).VerifyLevelConsistency(ctx, 0); err != nil {
+					t.Errorf("recovery left level zero skipping transactions: %v", err)
+				}
+				opt := litestream.NewRestoreOptions()
+				opt.OutputPath = filepath.Join(root, "restored.db")
+				mustBehind(litestream.NewReplicaWithClient(nil, client).Restore(ctx, opt))
+				restored, err := sql.Open("sqlite", opt.OutputPath)
+				mustBehind(err)
+				defer restored.Close()
+				var rows int
+				mustBehind(restored.QueryRow("SELECT count(*) FROM t").Scan(&rows))
+				if rows != 4 {
+					t.Fatalf("the cloud copy holds %d rows after recovery, want 4", rows)
+				}
+			})
+		}
+	}
+}
+
+func TestDB_BrokenLastUploadFileReuploadsFromTheReplica(t *testing.T) {
+	for name, breakFile := range map[string]func([]byte) []byte{
+		"empty":     func([]byte) []byte { return nil },
+		"truncated": func(b []byte) []byte { return b[:len(b)/2] },
+		"zeroed":    func(b []byte) []byte { return make([]byte, len(b)) },
+		"zero tail": func(b []byte) []byte { clear(b[len(b)/2:]); return b },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			root := t.TempDir()
+			path := filepath.Join(root, "primary.db")
+			client := file.NewReplicaClient(filepath.Join(root, "remote"))
+			c, err := sql.Open("sqlite", path)
+			mustBehind(err)
+			defer c.Close()
+			_, err = c.Exec("PRAGMA journal_mode = wal; PRAGMA wal_autocheckpoint = 0; CREATE TABLE t(x)")
+			mustBehind(err)
+			open := func(autoRecover bool) *litestream.DB {
+				db := litestream.NewDB(path)
+				db.SyncDriven = true
+				db.MonitorInterval = 0
+				db.Replica = litestream.NewReplicaWithClient(db, client)
+				db.Replica.MonitorEnabled = false
+				db.Replica.AutoRecoverEnabled = autoRecover
+				mustBehind(db.Open())
+				return db
+			}
+			insert := func(x int) {
+				_, err := c.Exec("INSERT INTO t VALUES (?)", x)
+				mustBehind(err)
+			}
+
+			before := open(false)
+			insert(1)
+			mustBehind(before.SyncAndWait(ctx))
+			insert(2)
+			mustBehind(before.SyncAndWait(ctx))
+			minTXID, maxTXID, err := before.MaxLTX()
+			mustBehind(err)
+			upload := before.LTXPath(0, minTXID, maxTXID)
+			mustBehind(before.Close(ctx))
+			data, err := os.ReadFile(upload)
+			mustBehind(err)
+			mustBehind(os.WriteFile(upload, breakFile(data), 0o600))
+
+			stuck := open(false)
+			if err := stuck.SyncAndWait(ctx); !errors.Is(err, litestream.ErrLTXCorrupted) {
+				t.Fatalf("a chat without auto-recover synced over its broken file: %v", err)
+			}
+			_ = stuck.Close(ctx)
+
+			after := open(true)
+			defer after.Close(ctx)
+			insert(3)
+			mustBehind(after.SyncAndWait(ctx))
+			if err := litestream.NewCompactor(client, nil).VerifyLevelConsistency(ctx, 0); err != nil {
+				t.Errorf("recovery left level zero skipping transactions: %v", err)
+			}
+			opt := litestream.NewRestoreOptions()
+			opt.OutputPath = filepath.Join(root, "restored.db")
+			mustBehind(litestream.NewReplicaWithClient(nil, client).Restore(ctx, opt))
+			restored, err := sql.Open("sqlite", opt.OutputPath)
+			mustBehind(err)
+			defer restored.Close()
+			var rows int
+			mustBehind(restored.QueryRow("SELECT count(*) FROM t").Scan(&rows))
+			if rows != 3 {
+				t.Fatalf("the cloud copy holds %d rows after recovery, want 3", rows)
+			}
 		})
 	}
 }
