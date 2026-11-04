@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -460,10 +461,45 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
 	}
 
+	var phase atomic.Value
+	phase.Store("is_open")
+	var deadline sync.Once
+	warnDeadline := func() {
+		if !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			return
+		}
+		deadline.Do(func() {
+			db.syncDiag.RLock()
+			holder := db.syncDiag.diagnostic(db.path)
+			db.syncDiag.RUnlock()
+			db.Logger.Warn("database sync deadline exceeded",
+				"path", path,
+				"request_phase", phase.Load().(string),
+				"wait", wait,
+				"checkpoint", checkpoint,
+				"holder_active", holder.Active,
+				"holder_operation", holder.Operation,
+				"holder_phase", holder.Phase,
+				"holder_reason", holder.Reason,
+				"holder_snapshotting", holder.Snapshotting,
+				"holder_elapsed_seconds", holder.ElapsedSeconds,
+				"holder_txid", holder.TXID,
+				"holder_wal_bytes", holder.WALSize,
+				"waiters", holder.ExecutorWaiterCount,
+				"wait_seconds", holder.ExecutorWaitSeconds)
+		})
+	}
+	stop := context.AfterFunc(ctx, warnDeadline)
+	defer func() {
+		stop()
+		warnDeadline()
+	}()
+
 	if !db.IsOpen() {
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotOpen, path)
 	}
 
+	phase.Store("read_position_before")
 	_, beforeTXID, err := db.MaxLTX()
 	if err != nil {
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
@@ -471,6 +507,7 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 
 	switch {
 	case checkpoint:
+		phase.Store("checkpoint")
 		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil {
 			if !isSQLiteBusyError(err) {
 				return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
@@ -478,15 +515,18 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 			db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
 		}
 	case wait:
+		phase.Store("sync_and_wait")
 		if err := db.SyncAndWait(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
 	default:
+		phase.Store("sync")
 		if err := db.Sync(ctx); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
 	}
 
+	phase.Store("read_position_after")
 	_, afterTXID, err := db.MaxLTX()
 	if err != nil {
 		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
@@ -494,6 +534,7 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 
 	var replicatedTXID uint64
 	if db.Replica != nil {
+		phase.Store("replica_position")
 		replicatedTXID = uint64(db.Replica.Pos().TXID)
 	}
 
