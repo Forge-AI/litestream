@@ -342,6 +342,23 @@ type diagPhase string
 
 const (
 	diagPhaseStarting                       diagPhase = "starting"
+	diagPhaseInitLock                       diagPhase = "init_lock"
+	diagPhaseInitStat                       diagPhase = "init_stat"
+	diagPhaseInitSQLite                     diagPhase = "init_sqlite"
+	diagPhaseInitReadLock                   diagPhase = "init_read_lock"
+	diagPhaseInitMetadata                   diagPhase = "init_metadata"
+	diagPhaseInitEnsureWAL                  diagPhase = "init_ensure_wal"
+	diagPhaseInitReplicaPosition            diagPhase = "init_replica_position"
+	diagPhaseInitReplicaList                diagPhase = "init_replica_list"
+	diagPhaseInitUploadFiles                diagPhase = "init_upload_files"
+	diagPhaseInitReplicaCleanup             diagPhase = "init_replica_cleanup"
+	diagPhaseInitReplicaPrepare             diagPhase = "init_replica_prepare"
+	diagPhaseInitReplicaDownload            diagPhase = "init_replica_download"
+	diagPhaseInitReplicaCopy                diagPhase = "init_replica_copy"
+	diagPhaseInitReplicaFsync               diagPhase = "init_replica_fsync"
+	diagPhaseInitReplicaUpload              diagPhase = "init_replica_upload"
+	diagPhaseInitReplicaRename              diagPhase = "init_replica_rename"
+	diagPhaseInitReplicaStart               diagPhase = "init_replica_start"
 	diagPhaseEnsureWAL                      diagPhase = "ensure_wal"
 	diagPhaseVerifyAndSync                  diagPhase = "verify_and_sync"
 	diagPhaseCheckpointIfNeeded             diagPhase = "checkpoint_if_needed"
@@ -899,6 +916,10 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 // replica. Blocks until both stages complete, except that it returns
 // ErrSnapshotting instead of queueing behind a full snapshot.
 func (db *DB) SyncAndWait(ctx context.Context) error {
+	return db.syncAndWait(ctx, func(string) {})
+}
+
+func (db *DB) syncAndWait(ctx context.Context, stage func(string)) error {
 	if db.Replica == nil {
 		return fmt.Errorf("no replica configured")
 	}
@@ -906,9 +927,11 @@ func (db *DB) SyncAndWait(ctx context.Context) error {
 	if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting); err != nil {
 		return fmt.Errorf("db sync: %w", err)
 	}
+	stage("replica_sync")
 	if err := db.Replica.Sync(ctx); err != nil {
 		return fmt.Errorf("replica sync: %w", err)
 	}
+	stage("compaction")
 	db.mu.Lock()
 	life := db.ctx
 	db.mu.Unlock()
@@ -1231,6 +1254,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Exit if no database file exists.
+	db.setSyncDiagPhase(diagPhaseInitStat)
 	fi, err := os.Stat(db.path)
 	if os.IsNotExist(err) {
 		return nil
@@ -1248,6 +1272,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
 		db.path, db.BusyTimeout.Milliseconds())
 
+	db.setSyncDiagPhase(diagPhaseInitSQLite)
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
 	}
@@ -1296,11 +1321,13 @@ func (db *DB) init(ctx context.Context) (err error) {
 
 	// Start a long-running read transaction to prevent other transactions
 	// from checkpointing.
+	db.setSyncDiagPhase(diagPhaseInitReadLock)
 	if err := db.acquireReadLock(ctx); err != nil {
 		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
 	// Read page size.
+	db.setSyncDiagPhase(diagPhaseInitSQLite)
 	if err := db.db.QueryRowContext(ctx, `PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
@@ -1308,11 +1335,13 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Ensure meta directory structure exists.
+	db.setSyncDiagPhase(diagPhaseInitMetadata)
 	if err := internal.MkdirAll(db.metaPath, db.dirInfo); err != nil {
 		return err
 	}
 
 	// Ensure WAL has at least one frame in it.
+	db.setSyncDiagPhase(diagPhaseInitEnsureWAL)
 	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
@@ -1339,6 +1368,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 
 	// Start replication.
 	if db.Replica != nil && !db.SyncDriven {
+		db.setSyncDiagPhase(diagPhaseInitReplicaStart)
 		db.Replica.Start(db.ctx)
 	}
 
@@ -1932,6 +1962,7 @@ func (db *DB) verifyUploadFiles(replicated ltx.TXID) error {
 // contiguous for compaction.
 func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	// Get database position from local L0 files
+	db.setSyncDiagPhase(diagPhaseInitReplicaPosition)
 	dbPos, err := db.Pos()
 	if db.recoversFrom(err) {
 		if dbPos, err = db.discardUploadFiles(err); err != nil {
@@ -1942,11 +1973,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 
 	// Get replica position from remote
+	db.setSyncDiagPhase(diagPhaseInitReplicaList)
 	replicaInfo, err := db.Replica.maxRestorableLTXFileInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get replica position: %w", err)
 	}
 	if db.Replica.AutoRecoverEnabled {
+		db.setSyncDiagPhase(diagPhaseInitUploadFiles)
 		if err := db.verifyUploadFiles(replicaInfo.MaxTXID); db.recoversFrom(err) {
 			if dbPos, err = db.discardUploadFiles(err); err != nil {
 				return err
@@ -1970,6 +2003,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	// Clear local L0 files
 	l0Dir := db.LTXLevelDir(0)
+	db.setSyncDiagPhase(diagPhaseInitReplicaCleanup)
 	if err := os.RemoveAll(l0Dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove L0 directory: %w", err)
 	}
@@ -1980,12 +2014,14 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
 	if replicaInfo.Level != 0 {
+		db.setSyncDiagPhase(diagPhaseInitReplicaList)
 		l0Info, err := db.Replica.MaxLTXFileInfo(ctx, 0)
 		if err != nil {
 			return fmt.Errorf("get replica L0 position: %w", err)
 		}
 		minTXID = max(minTXID, l0Info.MaxTXID+1)
 	}
+	db.setSyncDiagPhase(diagPhaseInitReplicaDownload)
 	remote, err := db.Replica.Client.OpenLTXFile(ctx, replicaInfo.Level, replicaInfo.MinTXID, maxTXID, 0, 0)
 	if err != nil {
 		return fmt.Errorf("open remote baseline file: %w", err)
@@ -1997,17 +2033,20 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	localPath := db.LTXPath(0, minTXID, maxTXID)
 	tmpPath := localPath + ".tmp"
 
+	db.setSyncDiagPhase(diagPhaseInitReplicaPrepare)
 	tmpFile, err := os.Create(tmpPath)
 	if err != nil {
 		return fmt.Errorf("create temp L0 file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
 
+	db.setSyncDiagPhase(diagPhaseInitReplicaCopy)
 	if _, err := io.Copy(tmpFile, reader); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("copy L0 file: %w", err)
 	}
 
+	db.setSyncDiagPhase(diagPhaseInitReplicaFsync)
 	if err := internal.Fsync(tmpFile); err != nil {
 		_ = tmpFile.Close()
 		return fmt.Errorf("sync L0 file: %w", err)
@@ -2018,10 +2057,12 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 
 	if replicaInfo.Level != 0 {
+		db.setSyncDiagPhase(diagPhaseInitReplicaPrepare)
 		bridge, err := os.Open(tmpPath)
 		if err != nil {
 			return fmt.Errorf("open L0 bridge: %w", err)
 		}
+		db.setSyncDiagPhase(diagPhaseInitReplicaUpload)
 		_, err = db.Replica.Client.WriteLTXFile(ctx, 0, minTXID, maxTXID, bridge)
 		_ = bridge.Close()
 		if err != nil {
@@ -2030,6 +2071,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 
 	// Atomically rename temp file to final path
+	db.setSyncDiagPhase(diagPhaseInitReplicaRename)
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		return fmt.Errorf("rename L0 file: %w", err)
 	}
@@ -2423,6 +2465,7 @@ func (db *DB) wroteL0(info ltx.FileInfo) {
 }
 
 func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
+	db.setSyncDiagPhase(diagPhaseInitLock)
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
