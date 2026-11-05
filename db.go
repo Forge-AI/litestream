@@ -81,6 +81,8 @@ type DB struct {
 	syncDiag  diagState
 	handover  handoverClaim
 	boundary  sync.Mutex
+	abandoned context.Context
+	abandon   context.CancelFunc
 
 	lastLTXPage               *verifiedLTXPage
 	checkpointBarrierReleased func()
@@ -453,6 +455,7 @@ func NewDB(path string) *DB {
 	db.pay = func(context.Context) {}
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
+	db.abandoned, db.abandon = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
@@ -1099,7 +1102,19 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	return err
 }
 
+// AbandonAll stops every database's full copy before it waits on any database,
+// so a checkpoint finishing in one never holds a copy running in another.
+func AbandonAll(dbs []*DB) {
+	for _, db := range dbs {
+		db.abandon()
+	}
+	for _, db := range dbs {
+		db.Abandon()
+	}
+}
+
 func (db *DB) Abandon() {
+	db.abandon()
 	db.boundary.Lock()
 }
 
@@ -2541,6 +2556,13 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, err error) {
+	if info.snapshotting {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		defer context.AfterFunc(db.abandoned, cancel)()
+	}
+
 	result.newWALSize = exec.state.lastSyncedWALOffset
 	result.syncedToWALEnd = exec.state.syncedToWALEnd
 	if info.clearSyncedToWALEnd {
@@ -2778,6 +2800,12 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			return result, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("close ltx file: %w", err)
+	}
+
+	if info.snapshotting {
+		if err := db.abandoned.Err(); err != nil {
+			return result, err
+		}
 	}
 
 	// Atomically rename file to final path.
@@ -3203,6 +3231,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	result, err = db.sync(ctx, true, exec, snapshotInfo, 0)
 	if err != nil {
+		exec.state.syncedToWALEnd = false
 		return false, fmt.Errorf("cannot snapshot after checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
