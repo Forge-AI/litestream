@@ -3,13 +3,16 @@ package litestream
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -66,6 +69,117 @@ func TestStore_IdleDatabasesAfterABurstMakeNoCallsAndDoNoWork(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStore_ADatabaseWrittenOnceADayNamesItsUploadsAndStartsLevelOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := NewStore(nil, CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: time.Minute},
+			{Level: 2, Interval: time.Hour},
+			{Level: 3, Interval: 24 * time.Hour},
+		})
+		store.L0Retention = 15 * time.Minute
+		store.RetentionEnabled = false
+		if err := store.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		db := registerCounted(t, store, dir, "sparse")
+		time.Sleep(time.Second)
+
+		const days = 5
+		for day := range days {
+			db.write(t, store, day)
+			synctest.Wait()
+			if err := store.FindDB(db.path).EnforceL0RetentionByTime(ctx); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(24 * time.Hour)
+		}
+
+		named := namedFiles(t, store, db)
+		for _, level := range []int{1, 2, 3, SnapshotLevel} {
+			for _, info := range uploadedFiles(t, db, level) {
+				name := compactedName{Level: level, Min: uint64(info.MinTXID), Max: uint64(info.MaxTXID)}
+				if !slices.Contains(named, name) {
+					t.Errorf("level %d file %v was uploaded and never named", level, name)
+				}
+			}
+		}
+		if len(uploadedFiles(t, db, 1)) == 0 {
+			t.Error("level 1 never started, so level-zero retention can never run")
+		}
+		levelZero, err := os.ReadDir(store.FindDB(db.path).LTXLevelDir(0))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(levelZero); got > 2 {
+			t.Errorf("%d local level-zero files remain after %d daily writes, want retention to keep at most 2", got, days)
+		}
+
+		restored := filepath.Join(dir, "restored")
+		opt := NewRestoreOptions()
+		opt.OutputPath = restored
+		if err := NewReplicaWithClient(nil, db.client).Restore(ctx, opt); err != nil {
+			t.Fatal(err)
+		}
+		check, err := sql.Open("sqlite", restored)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rows int
+		if err := check.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != days {
+			t.Errorf("a restore read %d rows, want %d", rows, days)
+		}
+
+		for _, closer := range []io.Closer{check, db.app} {
+			if err := closer.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := store.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+type compactedName struct {
+	Level int    `json:"level"`
+	Min   uint64 `json:"min"`
+	Max   uint64 `json:"max"`
+}
+
+func namedFiles(t *testing.T, store *Store, db *countedDB) []compactedName {
+	t.Helper()
+	log, err := os.ReadFile(filepath.Join(store.FindDB(db.path).MetaPath(), "compacted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []compactedName
+	for line := range strings.Lines(string(log)) {
+		var name compactedName
+		if err := json.Unmarshal([]byte(line), &name); err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func uploadedFiles(t *testing.T, db *countedDB, level int) []*ltx.FileInfo {
+	t.Helper()
+	infos, err := FindLTXFiles(context.Background(), db.client, level, false, func(*ltx.FileInfo) (bool, error) {
+		return true, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return infos
 }
 
 func TestStore_AfterANetworkDropIdleDatabasesMakeNoCalls(t *testing.T) {
