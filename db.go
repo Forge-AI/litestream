@@ -66,21 +66,24 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	boundary  sync.Mutex    // held across a checkpoint and its boundary sync; Abandon keeps it
-	opened    bool          // true if Open() was called and Close() not yet called
-	syncState syncState
-	syncDiag  diagState
-	handover  handoverClaim
+	mu                        sync.RWMutex
+	execSem                   *semaphore.Weighted
+	path                      string        // part to database
+	metaPath                  string        // Path to the database metadata.
+	db                        *sql.DB       // target database
+	f                         *os.File      // long-running db file descriptor
+	rtx                       *sql.Tx       // long running read transaction
+	pageSize                  int           // page size, in bytes
+	notify                    chan struct{} // closes on WAL change
+	chkMu                     sync.RWMutex  // checkpoint lock
+	checkpointBarrierReleased func()        // test seam: runs where queued writes race the checkpoint
+	boundary                  sync.Mutex    // held across a checkpoint and its boundary sync; Abandon keeps it
+	abandoned                 context.Context
+	abandon                   context.CancelFunc
+	opened                    bool // true if Open() was called and Close() not yet called
+	syncState                 syncState
+	syncDiag                  diagState
+	handover                  handoverClaim
 
 	lastLTXPage *verifiedLTXPage
 
@@ -445,6 +448,7 @@ func NewDB(path string) *DB {
 	db.openLTXFile = defaultOpenLTXFile
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
+	db.abandoned, db.abandon = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
@@ -1096,10 +1100,23 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	return err
 }
 
-// Abandon waits out an in-flight checkpoint and bars every later one, then
-// logs the position the next process resumes from. It neither syncs nor
-// closes, so the WAL tail no replica holds stays on disk for that process.
+// AbandonAll stops every database's full copy before it waits on any database,
+// so a checkpoint finishing in one never holds a copy running in another.
+func AbandonAll(dbs []*DB) {
+	for _, db := range dbs {
+		db.abandon()
+	}
+	for _, db := range dbs {
+		db.Abandon()
+	}
+}
+
+// Abandon stops a running full copy, waits out an in-flight checkpoint and bars
+// every later one, then logs the position the next process resumes from. It
+// neither syncs nor closes, so the WAL tail no replica holds stays on disk for
+// that process, whose own verify takes the full copy again if it is still owed.
 func (db *DB) Abandon() {
+	db.abandon()
 	db.boundary.Lock()
 	pos, err := db.Pos()
 	if err != nil {
@@ -2270,7 +2287,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncI
 	if err != nil {
 		return info, fmt.Errorf("read wal header after hand-over: %w", err)
 	}
-	db.Logger.Info("resuming the handed-over wal from its header",
+	db.Logger.Info("resuming the wal from its header",
 		"txid", exec.pos.TXID.String(),
 		"instead_of", info.reason)
 	return syncInfo{
@@ -2655,6 +2672,13 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, err error) {
+	if info.snapshotting {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+		defer context.AfterFunc(db.abandoned, cancel)()
+	}
+
 	result.newWALSize = exec.state.lastSyncedWALOffset
 	result.syncedToWALEnd = exec.state.syncedToWALEnd
 	if info.clearSyncedToWALEnd {
@@ -2892,6 +2916,12 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			return result, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("close ltx file: %w", err)
+	}
+
+	if info.snapshotting {
+		if err := db.abandoned.Err(); err != nil {
+			return result, err
+		}
 	}
 
 	// Atomically rename file to final path.
@@ -3229,6 +3259,9 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		}
 		barrierTx = nil
 	}
+	if db.checkpointBarrierReleased != nil {
+		db.checkpointBarrierReleased()
+	}
 
 	if err = db.bumpLitestreamSeq(ctx); err != nil {
 		return false, fmt.Errorf("bump litestream seq: %w", err)
@@ -3250,7 +3283,13 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	exec.state.truncatePassiveFailed = false
 
 	if mode == CheckpointModePassive {
+		// Queued writes can restart the WAL and overwrite the last synced frame
+		// before this verify. A restart needs a full backfill, the barrier sealed
+		// every frame into the last LTX file first, and our read lock bars a second
+		// backfill, so the new WAL always continues that file.
+		exec.state.handoverTXID = exec.pos.TXID
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		exec.state.handoverTXID = 0
 		if err != nil {
 			return false, fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
 		}
@@ -3310,6 +3349,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	result, err = db.sync(ctx, true, exec, snapshotInfo, 0)
 	if err != nil {
+		exec.state.syncedToWALEnd = false
 		return false, fmt.Errorf("cannot snapshot after checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
