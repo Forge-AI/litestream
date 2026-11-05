@@ -13,11 +13,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/superfly/ltx"
+
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
-	"github.com/superfly/ltx"
 )
 
 func TestDB_StartupHandoverResumesTheFirstFrame(t *testing.T) {

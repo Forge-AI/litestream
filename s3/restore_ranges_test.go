@@ -14,8 +14,9 @@ import (
 	"testing"
 	"time"
 
-	litestream "github.com/benbjohnson/litestream"
 	"github.com/superfly/ltx"
+
+	litestream "github.com/benbjohnson/litestream"
 )
 
 func TestReplica_Restore_S3Streams(t *testing.T) {
