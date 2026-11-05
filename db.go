@@ -82,7 +82,8 @@ type DB struct {
 	handover  handoverClaim
 	boundary  sync.Mutex
 
-	lastLTXPage *verifiedLTXPage
+	lastLTXPage               *verifiedLTXPage
+	checkpointBarrierReleased func()
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -3111,6 +3112,9 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		}
 		barrierTx = nil
 	}
+	if db.checkpointBarrierReleased != nil {
+		db.checkpointBarrierReleased()
+	}
 
 	if err = db.bumpLitestreamSeq(ctx); err != nil {
 		return false, fmt.Errorf("bump litestream seq: %w", err)
@@ -3132,7 +3136,14 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	exec.state.truncatePassiveFailed = false
 
 	if mode == CheckpointModePassive {
+		// Writes queued behind the barrier can restart the WAL and overwrite
+		// the last synced frame before this verify. The restart needed a full
+		// backfill of a log the barrier had sealed into the last LTX file, and
+		// our read lock on mark 0 bars another backfill, so the new log
+		// continues that file the way a hand-over does.
+		exec.state.handover = Handover{TXID: exec.pos.TXID}
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		exec.state.handover = Handover{}
 		if err != nil {
 			return false, fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
 		}
