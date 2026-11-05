@@ -14,7 +14,6 @@ env:
 
 permissions:
   contents: write
-  issues: write
 
 jobs:
   test:
@@ -49,18 +48,21 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - id: before
+        run: echo "old=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: imba-tjd/rebase-upstream-action@559f4270ba3c290f6009fc7114398a4ea07fa799
+        with:
+          upstream: benbjohnson/litestream
+          branch: main
+          depth: 0
+          push: false
       - id: rebase
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch https://github.com/benbjohnson/litestream.git main
-          upstream=$(git rev-parse FETCH_HEAD)
-          echo "old=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          if git merge-base --is-ancestor "$upstream" HEAD; then
+          upstream=$(git rev-parse upstream/main)
+          if [ "$(git rev-parse HEAD)" = "${{ steps.before.outputs.old }}" ]; then
             echo "current=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          git rebase "$upstream"
           echo "tag=${{ matrix.branch }}/$(date -u +%Y%m%d)-$(git rev-parse --short=12 "$upstream")" >> "$GITHUB_OUTPUT"
       - if: matrix.test && steps.rebase.outputs.current != 'true'
         run: go vet ./... && go test -count=1 -run "$FORGE_TESTS" . ./s3 ./abs ./gs ./internal ./cmd/litestream
@@ -68,17 +70,4 @@ jobs:
         run: |
           git tag "${{ steps.rebase.outputs.tag }}"
           git push origin "${{ steps.rebase.outputs.tag }}"
-          git push --force-with-lease=${{ matrix.branch }}:${{ steps.rebase.outputs.old }} origin HEAD:${{ matrix.branch }}
-      - if: failure()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          title="Nightly rebase of ${{ matrix.branch }} onto upstream main failed"
-          body="The ${{ matrix.branch }} branch could not move onto upstream main: $RUN"
-          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
-          if [ -n "$number" ]; then
-            gh issue comment "$number" --body "$body"
-          else
-            gh issue create --title "$title" --body "$body"
-          fi
+          git push --force-with-lease=${{ matrix.branch }}:${{ steps.before.outputs.old }} origin HEAD:${{ matrix.branch }}
