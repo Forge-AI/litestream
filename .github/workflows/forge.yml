@@ -1,0 +1,84 @@
+name: Forge
+
+on:
+  push:
+    branches: [forge]
+  pull_request:
+    branches: [forge]
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+env:
+  FORGE_TESTS: '^(TestDB_VerifyReadsOnlyTheLastSyncedPageOfTheLastLTXFile|TestDB_BehindReplicaTakesBaselineAboveSnapshot|TestDB_BrokenLastUploadFileReuploadsFromTheReplica|TestDB_BrokenEarlierUploadFileReuploadsFromTheReplica|TestReplica_LostPositionUnderSnapshotKeepsL0Contiguous|TestReplica_Restore_OpensPlanConcurrently|TestReplica_Restore_ReportsRisingByteCountsEndingAtTheImageSize|TestRestoreProgress_ReportsAWriteOnceTheIntervalHasPassed|TestStore_CompactDB|TestStore_ADatabaseWrittenOnceADayNamesItsUploadsAndStartsLevelOne|TestReplica_UploadLTXFile_RaisesCachedL0Max|TestDB_EnforceL0RetentionByTime_IdleSkipsListing|TestReplicaClient_LTXFilesListsFromSeek|TestReplicaClient_SignsWithItsDatabasesCredentialSource|TestReplicaClient_SignsWithRotatingSecret|TestDB_SyncAndWaitYieldsToARunningSnapshot|TestDB_SyncAndWaitYieldsWhenTheHolderStartsASnapshot|TestDB_SyncAndWaitQueuesBehindAnIncrementalHolder|TestDB_SyncAndWaitWaitsOutAShortSnapshot|TestDB_SyncAndWaitGivesEachSnapshotItsOwnSecond|TestServer_SyncDuringASnapshotAnswersUnavailable|TestServer_RegisterTakesTheDatabasesIntervals|TestServer_IdleRegisteredDatabasesDoNoWork|TestStore_IdleDatabasesAfterABurstMakeNoCallsAndDoNoWork|TestStore_AfterANetworkDropIdleDatabasesMakeNoCalls|TestServer_ASyncWhoseUploadIsRefusedAnswersForbidden|TestServer_ARegisteredDatabaseCheckpointsOnceASyncLeavesItsWALPastTheThreshold|TestStore_EachSyncDrivenWriteUploadsOneLTXFileAndSyncsOnce|TestServer_ARegisterAfterAStopTakesTheReplicaAndRetentionItNames|TestDB_SyncAndWaitFinishesACheckpointItsCallerAbandons|TestDB_WritesQueuedBehindAPassiveCheckpointKeepTheNextSyncIncremental|TestDB_AbandonStopsAFullCopyInsideACheckpointAndTheNextProcessLosesNothing|TestAbandonAll_ACheckpointInOneDatabaseDoesNotHoldACopyInAnother|TestDB_AbandonKeepsTheTailWithoutSyncing|TestDB_HandoverTXIDResumesTheTruncatedWAL|TestDB_HandoverTXIDBehindTheReplicaSnapshots|TestDB_HandoverWALEndResumesPastTheFramesTheClaimCovers|TestDB_StartupHandoverResumesTheFirstFrame|TestServer_SyncCheckpointDrainsASyncedOnePageLog|TestServer_SyncCheckpointDrainsALogAnEarlierLaneShipped|TestServer_SyncCheckpointKeepsTheReadTransactionPastItsTimeout|TestServer_SyncWithoutCheckpointLeavesTheLogAndAnIdleDatabaseShipsNothing|TestDB_CompactionAndSnapshotNameTheirUploadsInTheMetaDirectory|TestDB_NoLTXFilesOnIdleSync|TestDB_DelayedCheckpointAfterWrite|TestStore_SyncDeadlineNamesInitializationAtAnyDatabaseCount|TestStore_SyncDeadlineReportsOnceOnReturn|TestStore_SyncDeadlineNamesTheStagesAfterTheLocalSync|TestOwnerGone_.*|TestReplicaClient_MaxAttemptsBoundsTheCallsToABucketThatDropsEveryConnection|TestReplicaClient_MaxAttemptsBoundsTheCallsToAContainerThatDropsEveryConnection|TestReplicaClient_MaxAttemptsBoundsTheCallsToABucketThatAnswersEveryCallUnavailable|TestRestoreCommand_RunGivesUpOnADeadBucketAfterThreeCalls|TestRestoreCommand_RunJSONOutput|TestResumableReader_ReconnectsOnStalledStream)$'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  test:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -count=1 -run "$FORGE_TESTS" . ./s3 ./abs ./gs ./internal ./cmd/litestream
+
+  rebase:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: forge
+            test: true
+          - branch: forge-prod
+            test: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          token: ${{ secrets.FORGE_REBASE_TOKEN }}
+      - if: matrix.test
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - id: rebase
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch https://github.com/benbjohnson/litestream.git main
+          upstream=$(git rev-parse FETCH_HEAD)
+          echo "old=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git rebase "$upstream"
+          echo "tag=${{ matrix.branch }}/$(date -u +%Y%m%d)-$(git rev-parse --short=12 "$upstream")" >> "$GITHUB_OUTPUT"
+      - if: matrix.test && steps.rebase.outputs.current != 'true'
+        run: go vet ./... && go test -count=1 -run "$FORGE_TESTS" . ./s3 ./abs ./gs ./internal ./cmd/litestream
+      - if: steps.rebase.outputs.current != 'true'
+        run: |
+          git tag "${{ steps.rebase.outputs.tag }}"
+          git push origin "${{ steps.rebase.outputs.tag }}"
+          git push --force-with-lease=${{ matrix.branch }}:${{ steps.rebase.outputs.old }} origin HEAD:${{ matrix.branch }}
+      - if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Nightly rebase of ${{ matrix.branch }} onto upstream main failed"
+          body="The ${{ matrix.branch }} branch could not move onto upstream main: $RUN"
+          number=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
