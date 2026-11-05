@@ -1120,6 +1120,9 @@ type ReplicaSettings struct {
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecover *bool `yaml:"auto-recover"`
 
+	// Head is the full key of the chat's head object.
+	Head string `yaml:"head"`
+
 	// S3 settings
 	AccessKeyID         string    `yaml:"access-key-id"`
 	SecretAccessKey     string    `yaml:"secret-access-key"`
@@ -1372,6 +1375,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 
 	// Build replica.
 	r := litestream.NewReplica(db)
+	r.HeadKey = c.Head
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
 	}
