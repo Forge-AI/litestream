@@ -567,9 +567,7 @@ func (c *ReplicateCommand) Abandon() {
 	if c.Store == nil {
 		return
 	}
-	for _, db := range c.Store.DBs() {
-		db.Abandon()
-	}
+	litestream.AbandonAll(c.Store.DBs())
 }
 
 // SetDone sets the done channel used for interrupt handling during shutdown.
