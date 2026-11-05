@@ -18,8 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"customeredge"
-
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
@@ -31,6 +29,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/internal/customeredge"
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
