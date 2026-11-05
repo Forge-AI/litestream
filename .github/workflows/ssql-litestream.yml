@@ -1,10 +1,10 @@
-name: Forge
+name: ssql-litestream
 
 on:
   push:
-    branches: [forge]
+    branches: [ssql-litestream]
   pull_request:
-    branches: [forge]
+    branches: [ssql-litestream]
   schedule:
     - cron: "17 9 * * *"
   workflow_dispatch:
@@ -34,9 +34,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - branch: forge
+          - branch: ssql-litestream
             test: true
-          - branch: forge-prod
+          - branch: ssql-litestream-legacy
             test: false
     steps:
       - uses: actions/checkout@v4
