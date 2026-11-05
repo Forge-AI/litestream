@@ -748,6 +748,38 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	return out.Body, nil
 }
 
+// WriteHead writes one small object at a full key.
+func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(c.Bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(text),
+		ContentLength: aws.Int64(int64(len(text))),
+	})
+	if err != nil {
+		return fmt.Errorf("s3: put head %s: %w", key, err)
+	}
+	return nil
+}
+
+// ReadHead reads one small object at a full key.
+func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
+	if isNotExists(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, fmt.Errorf("s3: get head %s: %w", key, err)
+	}
+	defer func() { _ = out.Body.Close() }()
+	return io.ReadAll(out.Body)
+}
+
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
 // Objects smaller than the part size are written with a single PutObject call
