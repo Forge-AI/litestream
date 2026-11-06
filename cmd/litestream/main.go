@@ -153,7 +153,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		cmd, args = args[0], args[1:]
 	}
 
-	owner, err := exitWithOwner(ctx)
+	owner, gone, err := exitWithOwner(ctx)
 	if err != nil {
 		return err
 	}
@@ -162,7 +162,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
 	case "replicate":
-		return m.runReplicate(ctx, owner, args)
+		return m.runReplicate(ctx, gone, args)
 
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
