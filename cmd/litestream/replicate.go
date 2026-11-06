@@ -63,14 +63,14 @@ func NewReplicateCommand() *ReplicateCommand {
 	}
 }
 
-func (m *Main) runReplicate(ctx, owner context.Context, args []string) error {
+func (m *Main) runReplicate(ctx context.Context, ownerGone <-chan struct{}, args []string) error {
 	c := NewReplicateCommand()
 	if err := c.ParseFlags(ctx, args); err != nil {
 		return err
 	}
 	signals := signalChan()
 	defer signal.Stop(signals)
-	return c.runUntilStopped(ctx, signals, owner.Done())
+	return c.runUntilStopped(ctx, signals, ownerGone)
 }
 
 func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal, ownerDone <-chan struct{}) error {
