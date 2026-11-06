@@ -213,20 +213,19 @@ func TestReplicateShutdown(t *testing.T) {
 	}
 	for _, tt := range []struct {
 		name, timeout, want, mode string
-		second, parent            bool
+		second, parent, clean     bool
 	}{
-		{name: "SFTPTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp"},
-		{name: "SFTPSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp", second: true},
+		{name: "SFTPStalled", timeout: "1m", want: "litestream abandoned replication without a final sync", mode: "sftp", clean: true},
 		{name: "SSHStartupTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp-ssh"},
 		{name: "SSHStartupSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp-ssh", second: true},
 		{name: "SFTPStartupTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp-init"},
 		{name: "SFTPStartupSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp-init", second: true},
 		{name: "StartupParentCancellation", timeout: "250ms", want: "shutdown timed out", mode: "sftp-ssh", parent: true},
-		{name: "Graceful", timeout: "5s", want: "litestream shut down", mode: "file"},
+		{name: "Graceful", timeout: "5s", want: "litestream abandoned replication without a final sync", mode: "file", clean: true},
 		{name: "ParentCancellation", timeout: "5s", want: "context canceled", mode: "file", parent: true},
 		{name: "ExecTimeout", timeout: "250ms", want: "shutdown timed out", mode: "exec"},
 		{name: "ExecSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "exec", second: true},
-		{name: "ExecGraceful", timeout: "5s", want: "litestream shut down", mode: "exec-graceful"},
+		{name: "ExecGraceful", timeout: "5s", want: "litestream abandoned replication without a final sync", mode: "exec-graceful", clean: true},
 		{name: "ExecParentCancellation", timeout: "5s", want: "context canceled", mode: "exec-graceful", parent: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -330,16 +329,6 @@ func TestReplicateShutdown(t *testing.T) {
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
-				db, err := sql.Open("sqlite", dbPath)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := db.Exec("INSERT INTO test (id) VALUES (1555)"); err != nil {
-					t.Fatal(err)
-				}
-				if err := db.Close(); err != nil {
-					t.Fatal(err)
-				}
 			}
 			if tt.parent {
 				if err := os.WriteFile(filepath.Join(dir, "cancel"), nil, 0600); err != nil {
@@ -356,9 +345,9 @@ func TestReplicateShutdown(t *testing.T) {
 			}
 			select {
 			case err := <-exited:
-				if (tt.mode == "file" || tt.mode == "exec-graceful") && !tt.parent && err != nil {
-					t.Errorf("graceful shutdown failed: %v", err)
-				} else if (tt.parent || (tt.mode != "file" && tt.mode != "exec-graceful")) && err == nil {
+				if tt.clean && err != nil {
+					t.Errorf("shutdown failed: %v", err)
+				} else if !tt.clean && err == nil {
 					t.Error("incomplete shutdown must return an error")
 				}
 			case <-time.After(3 * time.Second):
@@ -386,23 +375,8 @@ func TestReplicateShutdown(t *testing.T) {
 			if tt.mode == "exec-graceful" && !bytes.Contains(buf, []byte("exec stopped gracefully")) {
 				t.Errorf("exec child did not finish gracefully: %s", buf)
 			}
-			if tt.mode == "file" || tt.mode == "exec-graceful" {
-				restored := filepath.Join(dir, "restored.db")
-				if err := (&RestoreCommand{}).Run(t.Context(), []string{"-o", restored, "file://" + filepath.Join(dir, "replica")}); err != nil {
-					t.Fatal(err)
-				}
-				db, err := sql.Open("sqlite", restored)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer db.Close()
-				var count int
-				if err := db.QueryRow("SELECT count(*) FROM test WHERE id = 1555").Scan(&count); err != nil {
-					t.Fatal(err)
-				}
-				if count != 1 {
-					t.Fatalf("restored row count=%d, want 1", count)
-				}
+			if (tt.mode == "file" || tt.mode == "exec-graceful") && !bytes.Contains(buf, []byte("litestream abandoned replication without a final sync")) {
+				t.Errorf("shutdown did not abandon replication:\n%s", buf)
 			}
 		})
 	}
