@@ -1,3 +1,5 @@
+//go:build unix
+
 package main
 
 import (
@@ -16,10 +18,10 @@ const (
 	ownerGoneGrace = 5 * time.Second
 )
 
-func exitWithOwner(ctx context.Context) (context.Context, error) {
+func exitWithOwner(ctx context.Context) (context.Context, <-chan struct{}, error) {
 	gone, err := ownerGone()
 	if err != nil || gone == nil {
-		return ctx, err
+		return ctx, nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
@@ -28,7 +30,7 @@ func exitWithOwner(ctx context.Context) (context.Context, error) {
 		time.Sleep(ownerGoneGrace)
 		os.Exit(1)
 	}()
-	return ctx, nil
+	return ctx, gone, nil
 }
 
 func ownerGone() (<-chan struct{}, error) {
