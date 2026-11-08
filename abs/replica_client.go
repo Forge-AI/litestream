@@ -15,8 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"customeredge"
-
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
@@ -29,6 +27,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/internal/customeredge"
 )
 
 func init() {
