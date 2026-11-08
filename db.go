@@ -87,6 +87,8 @@ type DB struct {
 
 	lastLTXPage *verifiedLTXPage
 
+	pendingFullSnapshots sync.Map
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -1791,9 +1793,6 @@ func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool,
 	if err != nil {
 		return syncResult{}, fmt.Errorf("cannot verify wal state: %w", err)
 	}
-	if info.snapshotting {
-		db.Logger.Warn("lane snapshot", "reason", info.reason, "txid", uint64(exec.pos.TXID+1))
-	}
 
 	db.setSyncDiagPhase(diagPhaseSyncLTX, func(s *diagState) {
 		s.txID = exec.pos.TXID + 1
@@ -2677,6 +2676,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
 		defer context.AfterFunc(db.abandoned, cancel)()
+		txID, started := exec.pos.TXID+1, time.Now()
+		db.Logger.Warn("lane snapshot", "reason", info.reason, "txid", uint64(txID))
+		defer func() { db.logFullSnapshotEnd(txID, info.reason, time.Since(started), result, err) }()
 	}
 
 	result.newWALSize = exec.state.lastSyncedWALOffset
@@ -2859,6 +2861,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	// If we need a full snapshot, then copy from the database & WAL.
 	// Otherwise, just copy incrementally from the WAL.
 	if info.snapshotting {
+		db.pendingFullSnapshots.Store(txID, struct{}{})
 		db.setSyncDiagPhase(diagPhaseWriteLTXFromDB,
 			func(s *diagState) {
 				s.txID = txID
@@ -2988,6 +2991,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	db.Logger.Debug("db sync", "status", "ok")
 
 	return result, nil
+}
+
+func (db *DB) logFullSnapshotEnd(txID ltx.TXID, reason string, elapsed time.Duration, result syncResult, err error) {
+	if err != nil {
+		db.pendingFullSnapshots.Delete(txID)
+		db.Logger.Warn("full snapshot failed", "reason", reason, "txid", uint64(txID), "elapsed_ms", elapsed.Milliseconds(), "error", err.Error())
+		return
+	}
+	db.Logger.Warn("full snapshot written", "reason", reason, "txid", uint64(txID), "elapsed_ms", elapsed.Milliseconds(), "size_bytes", result.l0FileInfo.Size)
 }
 
 func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
@@ -3672,16 +3684,20 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 // position, so operators can force a re-upload (replicate -force-snapshot).
 // Callers that want to skip duplicates check first, as Store.CompactDB does.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+	started := time.Now()
 	pos, r, err := db.SnapshotReader(ctx)
 	if err != nil {
+		db.Logger.Warn("level snapshot failed", "elapsed_ms", time.Since(started).Milliseconds(), "error", err.Error())
 		return nil, err
 	}
 	defer func() { _ = r.Close() }()
 
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
+		db.Logger.Warn("level snapshot failed", "txid", uint64(pos.TXID), "elapsed_ms", time.Since(started).Milliseconds(), "error", err.Error())
 		return info, err
 	}
+	db.Logger.Warn("level snapshot written", "txid", uint64(pos.TXID), "elapsed_ms", time.Since(started).Milliseconds(), "size_bytes", info.Size)
 
 	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m[SnapshotLevel] = info

@@ -10,9 +10,9 @@ import (
 
 const ownerFDEnv = "SANDSQL_OWNER_FD"
 
-func exitWithOwner(ctx context.Context) (context.Context, error) {
+func exitWithOwner(ctx context.Context) (context.Context, <-chan struct{}, error) {
 	if _, ok := os.LookupEnv(ownerFDEnv); ok {
-		return nil, fmt.Errorf("%s is not supported on this platform", ownerFDEnv)
+		return nil, nil, fmt.Errorf("%s is not supported on this platform", ownerFDEnv)
 	}
-	return ctx, nil
+	return ctx, nil, nil
 }
