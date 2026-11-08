@@ -18,8 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"customeredge"
-
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
@@ -31,6 +29,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/internal/customeredge"
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
@@ -154,7 +153,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		cmd, args = args[0], args[1:]
 	}
 
-	owner, err := exitWithOwner(ctx)
+	owner, gone, err := exitWithOwner(ctx)
 	if err != nil {
 		return err
 	}
@@ -163,7 +162,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
 	case "replicate":
-		return m.runReplicate(ctx, owner, args)
+		return m.runReplicate(ctx, gone, args)
 
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
