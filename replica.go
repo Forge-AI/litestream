@@ -1,9 +1,7 @@
 package litestream
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -42,7 +40,6 @@ type Replica struct {
 
 	syncSem     *semaphore.Weighted
 	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
-	taken       atomic.Bool
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -182,9 +179,6 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	if err := ctx.Err(); err != nil {
 		return result, context.Cause(ctx)
 	}
-	if r.taken.Load() {
-		return result, ErrLTXFileTaken
-	}
 
 	// Calculate current replica position, if unknown.
 	if r.Pos().IsZero() {
@@ -260,7 +254,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	defer func() { _ = f.Close() }()
 
 	started := time.Now()
-	info, err := r.writeLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
 	if err != nil {
 		if _, pending := r.db.pendingFullSnapshots.Load(maxTXID); level == 0 && pending {
 			r.Logger().Warn("full snapshot upload failed", "txid", uint64(maxTXID), "elapsed_ms", time.Since(started).Milliseconds(), "error", err.Error())
@@ -293,41 +287,6 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
 	return nil
-}
-
-func (r *Replica) writeLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, f *os.File) (*ltx.FileInfo, error) {
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
-	if !isTaken(err) {
-		return info, err
-	}
-	stored, err := r.Client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
-	if err != nil {
-		return nil, fmt.Errorf("open the stored ltx file: %w", err)
-	}
-	defer func() { _ = stored.Close() }()
-	theirs, ours := sha256.New(), sha256.New()
-	if _, err := io.Copy(theirs, stored); err != nil {
-		return nil, fmt.Errorf("read the stored ltx file: %w", err)
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	size, err := io.Copy(ours, f)
-	if err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(theirs.Sum(nil), ours.Sum(nil)) {
-		r.taken.Store(true)
-		return nil, ErrLTXFileTaken
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
-	hdr, _, err := ltx.PeekHeader(f)
-	if err != nil {
-		return nil, err
-	}
-	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID, Size: size, CreatedAt: time.UnixMilli(hdr.Timestamp).UTC()}, nil
 }
 
 // calcPos returns the last position saved to the replica for level 0.
@@ -514,10 +473,6 @@ func (r *Replica) monitor(ctx context.Context) {
 		if err := r.sync(ctx, r.MaxSyncLTXFiles); err != nil {
 			if errors.Is(err, errReplicaWaitForData) {
 				continue
-			}
-			if errors.Is(err, ErrLTXFileTaken) {
-				r.Logger().Error("another writer stored this database's next ltx file first; stopped shipping it", "error", err)
-				return
 			}
 
 			// Don't log context cancellation errors during shutdown
