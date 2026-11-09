@@ -463,8 +463,6 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error(), waitErr.Holder)
 		case errors.As(err, &waitErr):
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), waitErr.Holder)
-		case errors.Is(err, ErrLTXFileTaken):
-			writeJSONError(w, http.StatusPreconditionFailed, err.Error(), nil)
 		default:
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		}
