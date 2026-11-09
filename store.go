@@ -442,6 +442,8 @@ func (s *Store) payLevel(ctx context.Context, db *DB, lvl *CompactionLevel) (sti
 	case errors.Is(err, ErrDBNotReady):
 		db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 		return false
+	case errors.Is(err, ErrLTXFileTaken):
+		return false
 	case isRefused(err):
 		db.Logger.Warn("compaction refused; the next write retries it", "level", lvl.Level, "error", err)
 		return false
@@ -806,6 +808,9 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	if db.Replica.taken.Load() {
+		return nil, ErrLTXFileTaken
+	}
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}

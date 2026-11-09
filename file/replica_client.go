@@ -239,7 +239,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Move LTX file to final path when it has been written & synced to disk.
-	if err := os.Rename(tmpFilename, filename); err != nil {
+	if level == 0 {
+		if err := os.Link(tmpFilename, filename); err != nil {
+			return nil, err
+		}
+		if err := os.Remove(tmpFilename); err != nil {
+			return nil, err
+		}
+	} else if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
 	}
 	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {

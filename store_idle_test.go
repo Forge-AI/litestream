@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -316,6 +317,75 @@ func TestServer_ASyncWhoseUploadIsRefusedAnswersForbidden(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("status=%d body=%s, want 403: a refused upload is a refusal, not a server error", rec.Code, rec.Body)
 	}
+}
+
+func TestStore_TwoWritersOnOneDatabaseShipOneNextLTXFile(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore(nil, CompactionLevels{{Level: 0}})
+	shared := t.TempDir()
+	dirs := []string{t.TempDir(), t.TempDir()}
+	for _, dir := range dirs {
+		if err := os.Symlink(shared, filepath.Join(dir, "replica")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	winner := registerCounted(t, store, dirs[0], "chat")
+	loser := registerCounted(t, store, dirs[1], "chat")
+	t.Cleanup(func() {
+		for _, db := range []*countedDB{winner, loser} {
+			_ = db.app.Close()
+			_ = store.UnregisterDB(context.Background(), db.path)
+		}
+	})
+	for _, db := range []*countedDB{winner, loser} {
+		if _, err := store.SyncDB(ctx, db.path, true, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if w, l := store.FindDB(winner.path).Replica.Pos().TXID, store.FindDB(loser.path).Replica.Pos().TXID; w != l {
+		t.Fatalf("winner at %v, loser at %v: both writers must start from the same stored change", w, l)
+	}
+
+	winner.write(t, store, 1)
+	if _, err := loser.app.Exec(`INSERT INTO t VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SyncDB(ctx, loser.path, true, false); !errors.Is(err, ErrLTXFileTaken) {
+		t.Fatalf("the second writer of the next ltx file synced with %v, want ErrLTXFileTaken", err)
+	}
+
+	next := store.FindDB(winner.path).Replica.Pos().TXID
+	want, err := os.ReadFile(store.FindDB(winner.path).LTXPath(0, next, next))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := winner.client.OpenLTXFile(ctx, 0, next, next, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(stored)
+	_ = stored.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("the stored next ltx file is not the first writer's")
+	}
+
+	calls := loser.client.calls.Load()
+	if _, err := loser.app.Exec(`INSERT INTO t VALUES (3)`); err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	body := fmt.Sprintf(`{"path": %q, "wait": true}`, loser.path)
+	NewServer(store).handleSync(rec, httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(body)))
+	if rec.Code != http.StatusPreconditionFailed {
+		t.Fatalf("status=%d body=%s, want 412: a writer whose next ltx file was taken has stopped shipping", rec.Code, rec.Body)
+	}
+	if n := loser.client.calls.Load() - calls; n != 0 {
+		t.Fatalf("the stopped writer made %d more calls to the replica, want 0", n)
+	}
+	winner.write(t, store, 4)
 }
 
 type countedDB struct {

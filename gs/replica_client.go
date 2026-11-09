@@ -205,7 +205,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w := c.bkt.Object(key).NewWriter(writeCtx)
+	obj := c.bkt.Object(key)
+	if level == 0 {
+		obj = obj.If(storage.Conditions{DoesNotExist: true})
+	}
+	w := obj.NewWriter(writeCtx)
 
 	// Store timestamp in GCS metadata for accurate timestamp retrieval
 	w.Metadata = map[string]string{
