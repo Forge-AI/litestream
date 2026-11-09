@@ -658,6 +658,8 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			}
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
+			case errors.Is(err, ErrLTXFileTaken):
+				continue
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
@@ -839,6 +841,9 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	if db.Replica.taken.Load() {
+		return nil, ErrLTXFileTaken
+	}
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}

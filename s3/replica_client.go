@@ -807,7 +807,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("s3: upload to %s: part size must be at least %d bytes", key, manager.MinUploadPartSize)
 	}
 
-	size, timestamp, etag, err := c.uploadLTX(ctx, key, r, partSize)
+	size, timestamp, etag, err := c.uploadLTX(ctx, key, level, r, partSize)
 	if err != nil {
 		return nil, err
 	}
@@ -831,21 +831,21 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 // uploadLTX uploads LTX data from r to key, choosing between a single
 // PutObject and the multipart uploader based on the object size.
-func (c *ReplicaClient) uploadLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+func (c *ReplicaClient) uploadLTX(ctx context.Context, key string, level int, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
 	// The L0 replication path passes the local LTX file, so the size is
 	// known up front and the body stays seekable for SDK retries.
 	if rs, ok := r.(io.ReadSeeker); ok {
 		if start, err := rs.Seek(0, io.SeekCurrent); err == nil {
-			return c.uploadSizedLTX(ctx, key, rs, start, partSize)
+			return c.uploadSizedLTX(ctx, key, level, rs, start, partSize)
 		}
 		// Reader does not support seeking (e.g. piped file descriptor);
 		// nothing has been consumed, so treat it as an unsized stream.
 	}
-	return c.uploadStreamedLTX(ctx, key, r, partSize)
+	return c.uploadStreamedLTX(ctx, key, level, r, partSize)
 }
 
 // uploadSizedLTX uploads from a seekable reader whose size is known.
-func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.ReadSeeker, start, partSize int64) (int64, time.Time, *string, error) {
+func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, level int, rs io.ReadSeeker, start, partSize int64) (int64, time.Time, *string, error) {
 	end, err := rs.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, time.Time{}, nil, fmt.Errorf("s3: size ltx file %s: %w", key, err)
@@ -866,7 +866,7 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
 	}
 
-	input := c.putObjectInput(key, timestamp)
+	input := c.putObjectInput(key, level, timestamp)
 	input.Body = rs
 
 	if size < partSize || (c.PutObjectContentMD5 && size == partSize) {
@@ -889,7 +889,7 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 
 // uploadStreamedLTX uploads from a reader of unknown size, buffering up to
 // the part size to determine whether the object fits in a single PutObject.
-func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, level int, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
 	// Use TeeReader to peek at LTX header while preserving data for upload
 	var buf bytes.Buffer
 	hdr, _, err := ltx.PeekHeader(io.TeeReader(r, &buf))
@@ -902,7 +902,7 @@ func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.
 		return 0, time.Time{}, nil, fmt.Errorf("s3: buffer ltx stream %s: %w", key, err)
 	}
 
-	input := c.putObjectInput(key, timestamp)
+	input := c.putObjectInput(key, level, timestamp)
 
 	// Reaching EOF before the part size means the whole object is buffered.
 	if size := int64(buf.Len()); size < partSize {
@@ -947,7 +947,7 @@ func (c *ReplicaClient) putObject(ctx context.Context, input *s3.PutObjectInput)
 
 // putObjectInput returns a PutObjectInput populated with the client's write
 // parameters so the single-put and multipart paths stay in parity.
-func (c *ReplicaClient) putObjectInput(key string, timestamp time.Time) *s3.PutObjectInput {
+func (c *ReplicaClient) putObjectInput(key string, level int, timestamp time.Time) *s3.PutObjectInput {
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
@@ -955,6 +955,9 @@ func (c *ReplicaClient) putObjectInput(key string, timestamp time.Time) *s3.PutO
 		Metadata: map[string]string{
 			MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 		},
+	}
+	if level == 0 {
+		input.IfNoneMatch = aws.String("*")
 	}
 	if c.StorageClass != "" {
 		input.StorageClass = types.StorageClass(c.StorageClass)

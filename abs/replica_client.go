@@ -240,7 +240,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// Upload blob with proper content type, access tier, and metadata
 	// Azure metadata keys cannot contain hyphens, so use litestreamtimestamp
-	_, err = c.client.UploadStream(ctx, c.Bucket, key, rc, &azblob.UploadStreamOptions{
+	options := &azblob.UploadStreamOptions{
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: to.Ptr("application/octet-stream"),
 		},
@@ -248,7 +248,13 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		Metadata: map[string]*string{
 			MetadataKeyTimestamp: to.Ptr(timestamp.Format(time.RFC3339Nano)),
 		},
-	})
+	}
+	if level == 0 {
+		options.AccessConditions = &blob.AccessConditions{
+			ModifiedAccessConditions: &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)},
+		}
+	}
+	_, err = c.client.UploadStream(ctx, c.Bucket, key, rc, options)
 	if err != nil {
 		return nil, fmt.Errorf("abs: cannot upload ltx file %q: %w", key, err)
 	}
