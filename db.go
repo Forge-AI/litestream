@@ -2099,7 +2099,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 			return fmt.Errorf("open L0 bridge: %w", err)
 		}
 		db.setSyncDiagPhase(diagPhaseInitReplicaUpload)
-		_, err = db.Replica.Client.WriteLTXFile(ctx, 0, minTXID, maxTXID, bridge)
+		_, err = db.Replica.writeLTXFile(ctx, 0, minTXID, maxTXID, bridge)
 		_ = bridge.Close()
 		if err != nil {
 			return fmt.Errorf("upload L0 bridge: %w", err)

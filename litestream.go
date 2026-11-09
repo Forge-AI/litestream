@@ -6,13 +6,16 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/superfly/ltx"
+	"google.golang.org/api/googleapi"
 	_ "modernc.org/sqlite"
 )
 
@@ -36,6 +39,7 @@ var (
 	ErrLTXCorrupted     = errors.New("ltx file corrupted")
 	ErrLTXMissing       = errors.New("ltx file missing")
 	ErrDiskFull         = errors.New("disk full")
+	ErrLTXFileTaken     = errors.New("another writer stored this ltx file first")
 )
 
 // LTXError provides detailed context for LTX file errors with recovery hints.
@@ -100,6 +104,31 @@ func NewLTXError(op, path string, level int, minTXID, maxTXID uint64, err error)
 // failures and must not be silently ignored.
 func isShutdownError(ctx context.Context, err error) bool {
 	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
+}
+
+func isTaken(err error) bool {
+	var azure *azcore.ResponseError
+	if errors.As(err, &azure) && azure.ErrorCode == "BlobAlreadyExists" {
+		return true
+	}
+	return errors.Is(err, os.ErrExist) || statusCode(err) == http.StatusPreconditionFailed
+}
+
+func statusCode(err error) int {
+	var (
+		status interface{ HTTPStatusCode() int }
+		azure  *azcore.ResponseError
+		google *googleapi.Error
+	)
+	switch {
+	case errors.As(err, &status):
+		return status.HTTPStatusCode()
+	case errors.As(err, &azure):
+		return azure.StatusCode
+	case errors.As(err, &google):
+		return google.Code
+	}
+	return 0
 }
 
 // SQLite WAL constants.
