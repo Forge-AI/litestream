@@ -458,6 +458,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusConflict, err.Error(), nil)
 		case errors.Is(err, ErrSnapshotting):
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error(), nil)
+		case errors.Is(err, ErrLTXFileTaken):
+			writeJSONError(w, http.StatusPreconditionFailed, err.Error(), nil)
 		case isRefused(err):
 			writeJSONError(w, http.StatusForbidden, err.Error(), nil)
 		default:

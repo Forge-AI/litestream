@@ -39,6 +39,7 @@ var (
 	ErrLTXCorrupted     = errors.New("ltx file corrupted")
 	ErrLTXMissing       = errors.New("ltx file missing")
 	ErrDiskFull         = errors.New("disk full")
+	ErrLTXFileTaken     = errors.New("another writer stored this ltx file first")
 )
 
 // LTXError provides detailed context for LTX file errors with recovery hints.
@@ -106,21 +107,33 @@ func isShutdownError(ctx context.Context, err error) bool {
 }
 
 func isRefused(err error) bool {
+	code := statusCode(err)
+	return code == http.StatusUnauthorized || code == http.StatusForbidden
+}
+
+func isTaken(err error) bool {
+	var azure *azcore.ResponseError
+	if errors.As(err, &azure) && azure.ErrorCode == "BlobAlreadyExists" {
+		return true
+	}
+	return errors.Is(err, os.ErrExist) || statusCode(err) == http.StatusPreconditionFailed
+}
+
+func statusCode(err error) int {
 	var (
-		code   int
 		status interface{ HTTPStatusCode() int }
 		azure  *azcore.ResponseError
 		google *googleapi.Error
 	)
 	switch {
 	case errors.As(err, &status):
-		code = status.HTTPStatusCode()
+		return status.HTTPStatusCode()
 	case errors.As(err, &azure):
-		code = azure.StatusCode
+		return azure.StatusCode
 	case errors.As(err, &google):
-		code = google.Code
+		return google.Code
 	}
-	return code == http.StatusUnauthorized || code == http.StatusForbidden
+	return 0
 }
 
 // SQLite WAL constants.
