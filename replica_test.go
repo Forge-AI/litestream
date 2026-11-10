@@ -1304,13 +1304,10 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	}
 
 	// Create a replica with a mock client that simulates context cancellation during Sync
-	syncCount := 0
+	var uploaded atomic.Bool
 	mockClient := &mock.ReplicaClient{
 		LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
-			syncCount++
-			// First few calls succeed, then return context.Canceled
-			if syncCount <= 2 {
-				// Return an empty iterator
+			if !uploaded.Load() {
 				return ltx.NewFileInfoSliceIterator(nil), nil
 			}
 			// After initial syncs, act like a request in flight at shutdown:
@@ -1320,7 +1317,7 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 			return nil, ctx.Err()
 		},
 		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
-			// Always succeed for writes to allow normal operation
+			uploaded.Store(true)
 			return &ltx.FileInfo{
 				Level:     level,
 				MinTXID:   minTXID,
