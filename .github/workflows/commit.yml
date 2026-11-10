@@ -234,11 +234,19 @@ jobs:
       - name: Run LTX behavioral tests (short mode)
         env:
           LOG_LEVEL: DEBUG
+          SOAK_KEEP_TEMP: "1"
         run: |
           go test -tags 'integration,soak' \
             -run '^TestLTXBehavior$' \
             -short -v -timeout 15m \
             ./tests/integration/
+
+      - name: Upload Litestream logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltx-behavioral-gate-litestream-logs
+          path: /tmp/litestream-*/litestream.log
 
   s3-mock-test:
     name: Run S3 Mock Tests
