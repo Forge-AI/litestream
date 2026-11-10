@@ -219,10 +219,15 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		if err := ctx.Err(); err != nil {
 			return result, context.Cause(ctx)
 		}
-		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		uploaded, err := txID, r.uploadLTXFile(ctx, 0, txID, txID)
+		var missing *LTXError
+		if errors.As(err, &missing) && os.IsNotExist(missing.Err) {
+			uploaded, err = r.uploadFullSnapshot(ctx, txID)
+		}
+		if err != nil {
 			return result, err
 		}
-		r.SetPos(ltx.Pos{TXID: txID})
+		r.SetPos(ltx.Pos{TXID: uploaded})
 		result.synced = true
 		syncedFileN++
 	}
@@ -267,14 +272,8 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 		}
 	}
 
-	// Raise a cached L0 position that a failed local sync left behind the
-	// replica, so idle compaction still sees the file this upload added.
 	if level == 0 {
-		r.db.maxLTXFileInfos.Lock()
-		if cached, ok := r.db.maxLTXFileInfos.m[0]; ok && cached.MaxTXID < info.MaxTXID {
-			r.db.maxLTXFileInfos.m[0] = info
-		}
-		r.db.maxLTXFileInfos.Unlock()
+		r.raiseCachedL0Max(info)
 	}
 	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
@@ -289,11 +288,56 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	return nil
 }
 
-// calcPos returns the last position saved to the replica for level 0.
+func (r *Replica) uploadFullSnapshot(ctx context.Context, minTXID ltx.TXID) (ltx.TXID, error) {
+	r.db.mu.RLock()
+	lifetime := r.db.ctx
+	r.db.mu.RUnlock()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(lifetime, cancel)()
+	defer context.AfterFunc(r.db.abandoned, cancel)()
+
+	started := time.Now()
+	pos, rd, err := r.db.SnapshotReader(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("full snapshot from %s: %w", minTXID, err)
+	}
+	rebased := rebaseLTX(rd, minTXID)
+	defer func() { _ = rebased.Close() }()
+
+	info, err := r.Client.WriteLTXFile(ctx, 0, minTXID, pos.TXID, rebased)
+	if err != nil {
+		return 0, fmt.Errorf("write full snapshot: %w", err)
+	}
+	r.raiseCachedL0Max(info)
+	r.Logger().Warn("full snapshot uploaded",
+		"reason", "local history starts after the replica position",
+		"min_txid", uint64(minTXID),
+		"txid", uint64(pos.TXID),
+		"elapsed_ms", time.Since(started).Milliseconds(),
+		"size_bytes", info.Size)
+	return pos.TXID, nil
+}
+
+// raiseCachedL0Max raises a cached L0 position that a failed local sync left
+// behind the replica, so idle compaction still sees the file an upload added.
+func (r *Replica) raiseCachedL0Max(info *ltx.FileInfo) {
+	r.db.maxLTXFileInfos.Lock()
+	defer r.db.maxLTXFileInfos.Unlock()
+	if cached, ok := r.db.maxLTXFileInfos.m[0]; ok && cached.MaxTXID < info.MaxTXID {
+		r.db.maxLTXFileInfos.m[0] = info
+	}
+}
+
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	info, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
 		return pos, fmt.Errorf("max ltx file: %w", err)
+	}
+	if info.MaxTXID == 0 {
+		if info, err = r.maxRestorableLTXFileInfo(ctx); err != nil {
+			return pos, fmt.Errorf("max restorable ltx file: %w", err)
+		}
 	}
 	return ltx.Pos{TXID: info.MaxTXID}, nil
 }
