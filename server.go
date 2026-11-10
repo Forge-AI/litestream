@@ -450,6 +450,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
+	var snapshotTXID ltx.TXID
+	if err == nil && req.Snapshot {
+		snapshotTXID, err = s.store.snapshotDB(ctx, expandedPath)
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrDatabaseNotFound):
@@ -480,23 +484,29 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		Path:           expandedPath,
 		TXID:           result.TXID,
 		ReplicatedTXID: result.ReplicatedTXID,
+		SnapshotTXID:   uint64(snapshotTXID),
 	})
 }
 
-// SyncRequest is the request body for the /sync endpoint.
+// SyncRequest is the request body for the /sync endpoint. Snapshot writes a
+// snapshot of the database once the sync returns, whatever the snapshot
+// interval, unless the last snapshot already covers its position.
 type SyncRequest struct {
 	Path       string `json:"path"`
 	Wait       bool   `json:"wait,omitempty"`
 	Checkpoint bool   `json:"checkpoint,omitempty"`
+	Snapshot   bool   `json:"snapshot,omitempty"`
 	Timeout    int    `json:"timeout,omitempty"`
 }
 
-// SyncResponse is the response body for the /sync endpoint.
+// SyncResponse is the response body for the /sync endpoint. SnapshotTXID is
+// the TXID the database's last snapshot covers when the request asked for one.
 type SyncResponse struct {
 	Status         string `json:"status"`
 	Path           string `json:"path"`
 	TXID           uint64 `json:"txid"`
 	ReplicatedTXID uint64 `json:"replicated_txid"`
+	SnapshotTXID   uint64 `json:"snapshot_txid,omitempty"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

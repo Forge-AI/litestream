@@ -613,6 +613,27 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 	}, nil
 }
 
+func (s *Store) snapshotDB(ctx context.Context, path string) (ltx.TXID, error) {
+	db := s.FindDB(path)
+	if db == nil {
+		return 0, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
+	}
+	db.paying.Lock()
+	defer db.paying.Unlock()
+	last, err := db.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return 0, fmt.Errorf("fetch snapshot level info: %w", err)
+	}
+	info, err := snapshotPast(ctx, db, last)
+	switch {
+	case errors.Is(err, ErrNoCompaction):
+		return last.MaxTXID, nil
+	case err != nil:
+		return 0, fmt.Errorf("snapshot database: %w", err)
+	}
+	return info.MaxTXID, nil
+}
+
 // FindDB returns the database with the given path.
 func (s *Store) FindDB(path string) *DB {
 	s.mu.Lock()
@@ -836,20 +857,11 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 
 	// Shortcut if this is a snapshot since we are not pulling from a previous level.
 	if dstLevel == SnapshotLevel {
-		pos, err := db.Pos()
-		if err != nil {
-			return nil, fmt.Errorf("fetch db position: %w", err)
-		}
-		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
-			return nil, ErrNoCompaction
-		}
-
-		info, err := db.Snapshot(ctx)
+		info, err := snapshotPast(ctx, db, dstInfo)
 		if err != nil {
 			return info, err
 		}
 		s.compactedIn(db, dstLevel, prevCompactionAt)
-		db.Logger.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
 		return info, nil
 	}
 
@@ -898,6 +910,23 @@ func (s *Store) compactedIn(db *DB, level int, interval time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.compacted[level][db] = interval
+}
+
+func snapshotPast(ctx context.Context, db *DB, last ltx.FileInfo) (*ltx.FileInfo, error) {
+	pos, err := db.Pos()
+	if err != nil {
+		return nil, fmt.Errorf("fetch db position: %w", err)
+	}
+	if last.MaxTXID != 0 && last.MaxTXID >= pos.TXID {
+		return nil, ErrNoCompaction
+	}
+
+	info, err := db.Snapshot(ctx)
+	if err != nil {
+		return info, err
+	}
+	db.Logger.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
+	return info, nil
 }
 
 // EnforceSnapshotRetention removes old snapshots by timestamp and then
