@@ -307,9 +307,23 @@ func (r *Replica) uploadFullSnapshot(ctx context.Context, minTXID ltx.TXID) (ltx
 
 	info, err := r.Client.WriteLTXFile(ctx, 0, minTXID, pos.TXID, rebased)
 	if err != nil {
+		r.SetPos(ltx.Pos{})
 		return 0, fmt.Errorf("write full snapshot: %w", err)
 	}
 	r.raiseCachedL0Max(info)
+	ents, err := os.ReadDir(r.db.LTXLevelDir(0))
+	if err != nil {
+		r.Logger().Error("failed to list covered local l0 files", "error", err)
+	}
+	for _, ent := range ents {
+		lo, hi, err := ltx.ParseFilename(ent.Name())
+		if err != nil || lo < minTXID || hi >= pos.TXID {
+			continue
+		}
+		if err := r.db.deleteLocalLTXFile(0, lo, hi); err != nil {
+			r.Logger().Error("failed to remove covered local l0 file", "minTXID", lo, "maxTXID", hi, "error", err)
+		}
+	}
 	r.Logger().Warn("full snapshot uploaded",
 		"reason", "local history starts after the replica position",
 		"min_txid", uint64(minTXID),
