@@ -262,6 +262,42 @@ func TestDB_HandoverTXIDBehindTheReplicaSnapshots(t *testing.T) {
 	requireRestoreMatches(t, ctx, h)
 }
 
+func TestDB_HandoverOverACompactedStoreSnapshotsAboveTheBaseline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	h := handOverAcrossNodes(t, ctx, 0)
+	if _, err := litestream.NewCompactor(h.client, nil).Compact(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	itr, err := h.client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l0, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.client.DeleteLTXFiles(ctx, l0); err != nil {
+		t.Fatal(err)
+	}
+
+	proof, outcomes := proveLogged(t, ctx, h)
+	if proof.Continued {
+		t.Fatalf("a claim over a store with no level-0 file must not continue: %+v", proof)
+	}
+	if len(outcomes) != 1 || outcomes[0] != "head_differs" {
+		t.Fatalf("the lane must log the refused store hand-over with its cause, got %q", outcomes)
+	}
+	pages, commit, snapshots := shipFirstSync(t, ctx, h)
+	if pages != int(commit) {
+		t.Fatalf("a baseline taken from a compacted file must snapshot; the first sync shipped %d of %d pages", pages, commit)
+	}
+	if len(snapshots) != 1 {
+		t.Fatalf("a baseline taken from a compacted file must log one lane snapshot with its reason, got %q", snapshots)
+	}
+	requireRestoreMatches(t, ctx, h)
+}
+
 func handOverAcrossNodes(t *testing.T, ctx context.Context, behind ltx.TXID) handedOver {
 	t.Helper()
 	dir := t.TempDir()
