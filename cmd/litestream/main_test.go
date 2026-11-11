@@ -2052,97 +2052,6 @@ dbs:
 		}
 	})
 
-	t.Run("TruncatePageN", func(t *testing.T) {
-		filename := filepath.Join(t.TempDir(), "litestream.yml")
-		if err := os.WriteFile(filename, []byte(`
-dbs:
-  - path: /tmp/test.db
-    truncate-page-n: 100000
-    replica:
-      url: file:///tmp/replica
-`[1:]), 0666); err != nil {
-			t.Fatal(err)
-		}
-
-		config, err := main.ReadConfigFile(filename, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(config.DBs) != 1 {
-			t.Fatal("expected one database config")
-		}
-
-		dbc := config.DBs[0]
-		if dbc.TruncatePageN == nil {
-			t.Fatal("expected truncate-page-n to be set")
-		}
-		if got, want := *dbc.TruncatePageN, 100000; got != want {
-			t.Errorf("TruncatePageN = %d, want %d", got, want)
-		}
-
-		// Test that the value is properly applied to the DB
-		db, err := main.NewDBFromConfig(dbc)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if got, want := db.TruncatePageN, 100000; got != want {
-			t.Errorf("db.TruncatePageN = %d, want %d", got, want)
-		}
-	})
-
-	t.Run("BothCheckpointFields", func(t *testing.T) {
-		filename := filepath.Join(t.TempDir(), "litestream.yml")
-		if err := os.WriteFile(filename, []byte(`
-dbs:
-  - path: /tmp/test.db
-    min-checkpoint-page-count: 2000
-    truncate-page-n: 100000
-    replica:
-      url: file:///tmp/replica
-`[1:]), 0666); err != nil {
-			t.Fatal(err)
-		}
-
-		config, err := main.ReadConfigFile(filename, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(config.DBs) != 1 {
-			t.Fatal("expected one database config")
-		}
-
-		dbc := config.DBs[0]
-		if dbc.MinCheckpointPageN == nil {
-			t.Fatal("expected min-checkpoint-page-count to be set")
-		}
-		if got, want := *dbc.MinCheckpointPageN, 2000; got != want {
-			t.Errorf("MinCheckpointPageN = %d, want %d", got, want)
-		}
-
-		if dbc.TruncatePageN == nil {
-			t.Fatal("expected truncate-page-n to be set")
-		}
-		if got, want := *dbc.TruncatePageN, 100000; got != want {
-			t.Errorf("TruncatePageN = %d, want %d", got, want)
-		}
-
-		// Test that both values are properly applied to the DB
-		db, err := main.NewDBFromConfig(dbc)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if got, want := db.MinCheckpointPageN, 2000; got != want {
-			t.Errorf("db.MinCheckpointPageN = %d, want %d", got, want)
-		}
-		if got, want := db.TruncatePageN, 100000; got != want {
-			t.Errorf("db.TruncatePageN = %d, want %d", got, want)
-		}
-	})
-
 	t.Run("NotSpecified_UsesDefaults", func(t *testing.T) {
 		filename := filepath.Join(t.TempDir(), "litestream.yml")
 		if err := os.WriteFile(filename, []byte(`
@@ -2167,9 +2076,6 @@ dbs:
 		if dbc.MinCheckpointPageN != nil {
 			t.Errorf("expected MinCheckpointPageN to be nil when not specified, got %v", *dbc.MinCheckpointPageN)
 		}
-		if dbc.TruncatePageN != nil {
-			t.Errorf("expected TruncatePageN to be nil when not specified, got %v", *dbc.TruncatePageN)
-		}
 
 		// Test that the DB uses default values
 		db, err := main.NewDBFromConfig(dbc)
@@ -2179,9 +2085,6 @@ dbs:
 
 		if got, want := db.MinCheckpointPageN, litestream.DefaultMinCheckpointPageN; got != want {
 			t.Errorf("db.MinCheckpointPageN = %d, want default %d", got, want)
-		}
-		if got, want := db.TruncatePageN, litestream.DefaultTruncatePageN; got != want {
-			t.Errorf("db.TruncatePageN = %d, want default %d", got, want)
 		}
 	})
 }

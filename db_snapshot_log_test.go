@@ -231,14 +231,15 @@ func TestDB_TwoFullSnapshotsWrittenBeforeUploadsDrainEachNameTheirOwnUpload(t *t
 	if err := db.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Checkpoint(ctx, litestream.CheckpointModeTruncate); err != nil {
+	litestream.ForgetLastWALPosition(t, db)
+	if err := db.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
 
 	lines := snapshotLines(t, logs)
 	started, written := snapshotTXIDs(lines["lane snapshot"]), snapshotTXIDs(lines["full snapshot written"])
-	if len(written) < 2 || !slices.Equal(started, written) {
-		t.Fatalf("started txids %v, written txids %v, want the first sync and the checkpoint boundary to each start and write a snapshot:\n%s", started, written, logs.Bytes())
+	if len(written) != 2 || !slices.Equal(started, written) {
+		t.Fatalf("started txids %v, written txids %v, want both syncs to each start and write a snapshot:\n%s", started, written, logs.Bytes())
 	}
 
 	if err := db.Replica.Sync(ctx); err != nil {

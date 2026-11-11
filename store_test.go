@@ -829,7 +829,7 @@ func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate); err != nil {
+	if err := db.Checkpoint(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 

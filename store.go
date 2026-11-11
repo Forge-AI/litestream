@@ -508,7 +508,7 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 	switch {
 	case checkpoint:
 		phase.Store("checkpoint")
-		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil {
+		if err := db.CheckpointOutlivingCaller(ctx); err != nil {
 			if !isSQLiteBusyError(err) {
 				return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
 			}

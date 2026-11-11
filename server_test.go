@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -414,32 +413,6 @@ func TestServer_HandleRegister(t *testing.T) {
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		require.Equal(t, "already_registered", result.Status)
 	})
-}
-
-func TestServer_ARegisteredDatabaseTakesItsTruncatePageN(t *testing.T) {
-	store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
-	store.CompactionMonitorEnabled = false
-	require.NoError(t, store.Open(t.Context()))
-	defer store.Close(t.Context())
-
-	server := litestream.NewServer(store)
-	server.SocketPath = testSocketPath(t)
-	require.NoError(t, server.Start())
-	defer server.Close()
-
-	db, sqldb := testingutil.MustOpenDBs(t)
-	testingutil.MustCloseDBs(t, db, sqldb)
-
-	client := newSocketClient(t, server.SocketPath)
-	body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s", "truncate_page_n": %d}`, db.Path(), t.TempDir(), math.MaxUint32)
-	resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
-	require.NoError(t, err)
-	defer resp.Body.Close()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	require.Len(t, store.DBs(), 1)
-	require.Equal(t, math.MaxUint32, store.DBs()[0].TruncatePageN,
-		"a database registered after its lane started must keep litestream's blocking TRUNCATE checkpoint out of reach like one the lane's config named")
 }
 
 func TestServer_HandleUnregister(t *testing.T) {

@@ -47,7 +47,7 @@ func TestDB_StartupHandoverResumesTheFirstFrame(t *testing.T) {
 			if err := before.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			if err := before.Checkpoint(ctx, litestream.CheckpointModePassive); err != nil {
+			if err := before.Checkpoint(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if err := before.Close(ctx); err != nil {

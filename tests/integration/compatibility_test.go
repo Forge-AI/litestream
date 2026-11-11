@@ -52,7 +52,7 @@ func TestRestore_FormatConsistency(t *testing.T) {
 	}
 
 	// Checkpoint to ensure data is persisted
-	if err := db.Checkpoint(ctx, litestream.CheckpointModeTruncate); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 

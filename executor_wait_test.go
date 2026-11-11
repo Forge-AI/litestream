@@ -474,13 +474,7 @@ func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
 		t.Fatal(err)
 	}
 	defer sqldb.Close()
-	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1), (2)`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -494,11 +488,11 @@ func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
 		return defaultOpenLTXFile(name, flag, perm)
 	}
 	checkpointed := make(chan error, 1)
-	go func() { checkpointed <- db.Checkpoint(context.Background(), CheckpointModeTruncate) }()
+	go func() { checkpointed <- db.Checkpoint(context.Background()) }()
 	select {
 	case <-copying:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the checkpoint took no boundary copy")
+		t.Fatal("the checkpoint took no first full copy")
 	}
 	return checkpointed
 }
