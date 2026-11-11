@@ -762,7 +762,6 @@ type DBConfig struct {
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
-	TruncatePageN      *int           `yaml:"truncate-page-n"`
 	MaxSyncWALBytes    *int64         `yaml:"max-sync-wal-bytes"`
 	SyncDriven         bool           `yaml:"sync-driven"`
 	Retention          *bool          `yaml:"retention"`
@@ -808,9 +807,6 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MinCheckpointPageN != nil {
 		db.MinCheckpointPageN = *dbc.MinCheckpointPageN
-	}
-	if dbc.TruncatePageN != nil {
-		db.TruncatePageN = *dbc.TruncatePageN
 	}
 	if dbc.MaxSyncWALBytes != nil {
 		db.MaxSyncWALBytes = *dbc.MaxSyncWALBytes

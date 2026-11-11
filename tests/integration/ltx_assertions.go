@@ -413,8 +413,7 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 			continue
 		}
 
-		if isExpectedRecoverySnapshot(snapEv.Reason) ||
-			isExpectedTruncateBoundarySnapshot(checkpointEv, snapEv) {
+		if isExpectedRecoverySnapshot(snapEv.Reason) {
 			expectedSnapshots++
 			continue
 		}
@@ -488,13 +487,6 @@ func isExpectedRecoverySnapshot(reason string) bool {
 	return strings.Contains(reason, "repair snapshot") ||
 		strings.Contains(reason, "compaction detected missing") ||
 		strings.Contains(reason, "wal header salt reset")
-}
-
-// PR #1292 requires emergency TRUNCATE checkpoints to take a boundary snapshot;
-// issue #1198 tracks the remaining cost of those full L0 snapshots.
-func isExpectedTruncateBoundarySnapshot(checkpoint, snapshot LTXEvent) bool {
-	return strings.EqualFold(checkpoint.CheckpointMode, "TRUNCATE") &&
-		snapshot.Reason == "checkpoint boundary snapshot"
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
