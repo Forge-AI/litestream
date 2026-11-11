@@ -2330,6 +2330,11 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
 	info.prevCommit = dec.Header().Commit
+	if info.offset < WALHeaderSize {
+		info.offset = WALHeaderSize
+		info.reason = "last ltx file holds no wal position, snapshotting"
+		return info, nil
+	}
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
