@@ -578,6 +578,7 @@ type RegisterDatabaseRequest struct {
 	ReplicaURL           string `json:"replica_url"`
 	HandoverTXID         uint64 `json:"handover_txid,omitempty"`
 	CheckpointIntervalMS int64  `json:"checkpoint_interval_ms,omitempty"`
+	TruncatePageN        int    `json:"truncate_page_n,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -646,6 +647,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.CheckpointIntervalMS != 0 {
 		db.CheckpointInterval = time.Duration(req.CheckpointIntervalMS) * time.Millisecond
+	}
+	if req.TruncatePageN != 0 {
+		db.TruncatePageN = req.TruncatePageN
 	}
 
 	// Create replica and attach client.
