@@ -408,7 +408,7 @@ func TestReplicateShutdown(t *testing.T) {
 			if !strings.HasPrefix(tt.mode, "sftp") {
 				deadline := time.Now().Add(10 * time.Second)
 				for {
-					files, err := filepath.Glob(filepath.Join(litestream.LTXLevelDir(filepath.Join(dir, "replica"), 0), "*.ltx"))
+					files, err := filepath.Glob(filepath.Join(litestream.LTXDir(filepath.Join(dir, "replica")), "*", "*.ltx"))
 					if err != nil {
 						t.Fatal(err)
 					}

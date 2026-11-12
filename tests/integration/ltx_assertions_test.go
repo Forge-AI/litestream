@@ -78,7 +78,7 @@ time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=beta.db snap=true reason="chec
 	}
 }
 
-func TestAssertNoSnapshotOnCheckpointAllowsStartupAndTruncateSnapshots(t *testing.T) {
+func TestAssertNoSnapshotOnCheckpointAllowsTheStartupSnapshot(t *testing.T) {
 	events := []LTXEvent{
 		{
 			Time:   mustParseLogTime(t, "time=2026-07-25T01:00:00Z"),
@@ -89,14 +89,7 @@ func TestAssertNoSnapshotOnCheckpointAllowsStartupAndTruncateSnapshots(t *testin
 			Time:           mustParseLogTime(t, "time=2026-07-25T01:00:02Z"),
 			Database:       "test.db",
 			Type:           "checkpoint",
-			CheckpointMode: "TRUNCATE",
-		},
-		{
-			Time:     mustParseLogTime(t, "time=2026-07-25T01:00:03Z"),
-			Database: "test.db",
-			Type:     "sync",
-			IsSnap:   true,
-			Reason:   "checkpoint boundary snapshot",
+			CheckpointMode: "PASSIVE",
 		},
 	}
 

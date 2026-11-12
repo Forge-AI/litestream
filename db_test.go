@@ -98,60 +98,6 @@ func TestDB_MetaPath(t *testing.T) {
 	})
 }
 
-// Ensure we can compute a checksum on the real database.
-func TestDB_CRC64(t *testing.T) {
-	t.Run("ErrNotExist", func(t *testing.T) {
-		db := testingutil.MustOpenDB(t)
-		defer testingutil.MustCloseDB(t, db)
-		if _, _, err := db.CRC64(context.Background()); !os.IsNotExist(err) {
-			t.Fatalf("unexpected error: %#v", err)
-		}
-	})
-
-	t.Run("DB", func(t *testing.T) {
-		db, sqldb := testingutil.MustOpenDBs(t)
-		defer testingutil.MustCloseDBs(t, db, sqldb)
-
-		t.Log("sync database")
-
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		t.Log("compute crc64")
-
-		chksum0, _, err := db.CRC64(context.Background())
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		t.Log("issue change")
-
-		// Issue change that is applied to the WAL. Checksum should not change.
-		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
-			t.Fatal(err)
-		} else if chksum1, _, err := db.CRC64(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if chksum0 == chksum1 {
-			t.Fatal("expected different checksum event after WAL change")
-		}
-
-		t.Log("checkpointing database")
-
-		// Checkpoint change into database. Checksum should change.
-		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
-			t.Fatal(err)
-		}
-
-		t.Log("compute crc64 again")
-
-		if chksum2, _, err := db.CRC64(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if chksum0 == chksum2 {
-			t.Fatal("expected different checksums after checkpoint")
-		}
-	})
-}
-
 // Ensure we can sync the real WAL to the shadow WAL.
 func TestDB_Sync(t *testing.T) {
 	// Ensure sync is skipped if no database exists.
@@ -233,7 +179,7 @@ func TestDB_Sync(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
 
-		// Issue initial sync and truncate WAL.
+		// Issue initial sync.
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -244,7 +190,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Checkpoint & fully close which should close WAL file.
-		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
+		if err := db.Checkpoint(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -284,7 +230,7 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Issue initial sync and truncate WAL.
+		// Issue initial sync.
 		if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -361,41 +307,6 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		} else if got, want := pos.TXID, ltx.TXID(3); got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
-		}
-	})
-
-	// Ensure DB forces a truncate checkpoint once WAL exceeds the threshold.
-	t.Run("TruncatePageN", func(t *testing.T) {
-		db, sqldb := testingutil.MustOpenDBs(t)
-		defer testingutil.MustCloseDBs(t, db, sqldb)
-		db.TruncatePageN = 1
-
-		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		}
-		if err := db.Sync(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-
-		payloadSize := db.PageSize()
-		if payloadSize == 0 {
-			payloadSize = 4096
-		}
-		payload := strings.Repeat("x", payloadSize)
-
-		// Grow the WAL until we have more than one full page worth of changes.
-		for walPageCountForTest(t, db) <= 1 {
-			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES (?);`, payload); err != nil {
-				t.Fatal(err)
-			}
-		}
-
-		if err := db.Sync(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-
-		if got := walPageCountForTest(t, db); got > 1 {
-			t.Fatalf("expected truncate checkpoint to shrink wal, pages=%d", got)
 		}
 	})
 
@@ -535,26 +446,6 @@ func TestDB_Compact(t *testing.T) {
 	})
 }
 
-func walPageCountForTest(tb testing.TB, db *litestream.DB) int64 {
-	tb.Helper()
-
-	fi, err := os.Stat(db.WALPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0
-		}
-		tb.Fatalf("stat wal: %v", err)
-	}
-
-	pageSize := db.PageSize()
-	if pageSize <= 0 || fi.Size() <= litestream.WALHeaderSize {
-		return 0
-	}
-
-	frameSize := int64(litestream.WALFrameHeaderSize + pageSize)
-	return (fi.Size() - litestream.WALHeaderSize) / frameSize
-}
-
 func TestDB_Snapshot(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -580,10 +471,14 @@ func TestDB_Snapshot(t *testing.T) {
 	}
 
 	// Calculate local checksum
-	chksum0, _, err := db.CRC64(t.Context())
+	if err := db.Checkpoint(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(db.Path())
 	if err != nil {
 		t.Fatal(err)
 	}
+	chksum0 := crc64.Checksum(data, crc64.MakeTable(crc64.ISO))
 
 	// Fetch remote LTX snapshot file and ensure it matches the checksum of the local database.
 	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 2, 0, 0)
@@ -1574,7 +1469,7 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Checkpoint(t.Context(), litestream.CheckpointModePassive); err != nil {
+	if err := db.Checkpoint(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 

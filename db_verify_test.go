@@ -93,7 +93,7 @@ func TestDB_VerifyReadsOnlyTheLastSyncedPageOfTheLastLTXFile(t *testing.T) {
 	if err := db.Sync(ctx); err != nil {
 		t.Fatalf("a sync read LTX pages besides the last synced one: %v", err)
 	}
-	if err := db.Checkpoint(ctx, litestream.CheckpointModePassive); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatalf("a passive checkpoint read LTX pages besides the last synced one: %v", err)
 	}
 	pos, err := db.Pos()

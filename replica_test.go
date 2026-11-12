@@ -68,11 +68,11 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Reset WAL so the next write will only write out the segment we are checking.
-	if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
+	if err := db.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Execute a query to write something into the truncated WAL.
+	// Execute a query to write something into the restarted WAL.
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 		t.Fatal(err)
 	}

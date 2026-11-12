@@ -21,13 +21,9 @@ const (
 	MetaDirSuffix = "-litestream"
 )
 
-// SQLite checkpoint modes.
-const (
-	CheckpointModePassive  = "PASSIVE"
-	CheckpointModeFull     = "FULL"
-	CheckpointModeRestart  = "RESTART"
-	CheckpointModeTruncate = "TRUNCATE"
-)
+// CheckpointModePassive is the only mode a DB checkpoints in. The one TRUNCATE
+// left, in checkpointV3, folds the <output>.tmp file a v0.3 restore builds.
+const CheckpointModePassive = "PASSIVE"
 
 // Litestream errors.
 var (
