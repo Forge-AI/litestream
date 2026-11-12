@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -72,6 +73,7 @@ type DB struct {
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+	moved     atomic.Int64
 	handover  handoverClaim
 
 	pendingFullSnapshots sync.Map
@@ -2802,6 +2804,8 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *o
 			continue
 		}
 
+		db.move()
+
 		// Check if the caller has canceled during processing.
 		select {
 		case <-ctx.Done():
@@ -2870,6 +2874,7 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
+		db.move()
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
