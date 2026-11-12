@@ -441,10 +441,15 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
-	if req.Wait && req.Timeout == 0 {
+	if req.Wait && req.Timeout == 0 && req.Stall == 0 {
 		req.Timeout = 30
 	}
-	if req.Timeout > 0 {
+	switch db := s.store.FindDB(expandedPath); {
+	case req.Stall > 0 && db != nil:
+		var cancel context.CancelFunc
+		ctx, cancel = db.untilStalled(ctx, time.Duration(req.Stall)*time.Second)
+		defer cancel()
+	case req.Timeout > 0:
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 		defer cancel()
@@ -453,6 +458,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
 		switch {
+		case errors.Is(context.Cause(ctx), ErrStalled):
+			writeJSONError(w, http.StatusGatewayTimeout, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotFound):
 			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotOpen):
@@ -490,6 +497,9 @@ type SyncRequest struct {
 	Wait       bool   `json:"wait,omitempty"`
 	Checkpoint bool   `json:"checkpoint,omitempty"`
 	Timeout    int    `json:"timeout,omitempty"`
+	// Stall, in seconds, ends the sync only once it moves no bytes for that
+	// long, in place of Timeout.
+	Stall int `json:"stall,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.
