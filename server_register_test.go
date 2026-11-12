@@ -89,18 +89,18 @@ func TestServer_ARegisteredDatabaseCheckpointsOnceASyncLeavesItsWALPastTheThresh
 	}
 	before := idleWork([]*DB{db})
 	under := synced(1)
-	if under.passive != before.passive || under.truncate != before.truncate {
+	if under.passive != before.passive {
 		t.Fatalf("a write synced under the WAL threshold went from %+v to %+v, want no checkpoint", before, under)
 	}
 	db.MinCheckpointPageN = 1
 	past := synced(2)
-	if past.passive != under.passive+1 || past.truncate != under.truncate {
-		t.Fatalf("a write synced past the WAL threshold went from %+v to %+v, want one PASSIVE checkpoint and no TRUNCATE", under, past)
+	if past.passive != under.passive+1 {
+		t.Fatalf("a write synced past the WAL threshold went from %+v to %+v, want one PASSIVE checkpoint", under, past)
 	}
 	if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
 		t.Fatal(err)
 	}
-	if idle := idleWork([]*DB{db}); idle.passive != past.passive || idle.truncate != past.truncate {
+	if idle := idleWork([]*DB{db}); idle.passive != past.passive {
 		t.Fatalf("a sync with nothing new went from %+v to %+v, want no checkpoint", past, idle)
 	}
 }
@@ -172,15 +172,14 @@ func registerSynced(t *testing.T, server *Server, dir string, i int) *DB {
 }
 
 type work struct {
-	syncs, passive, truncate float64
-	replicated               time.Time
+	syncs, passive float64
+	replicated     time.Time
 }
 
 func idleWork(dbs []*DB) (w work) {
 	for _, db := range dbs {
 		w.syncs += testutil.ToFloat64(syncNCounterVec.WithLabelValues(db.Path()))
 		w.passive += testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
-		w.truncate += testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 		if at := db.LastSuccessfulSyncAt(); at.After(w.replicated) {
 			w.replicated = at
 		}

@@ -45,7 +45,7 @@ func TestDB_AbandonKeepsTheTailWithoutSyncing(t *testing.T) {
 	require.Equal(t, replicated.TXID, remote.MaxTXID, "an abandon uploads nothing")
 
 	checkpointed := make(chan error, 1)
-	go func() { checkpointed <- db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate) }()
+	go func() { checkpointed <- db.Checkpoint(t.Context()) }()
 	select {
 	case err := <-checkpointed:
 		t.Fatalf("a checkpoint ran after the abandon: %v", err)

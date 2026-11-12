@@ -702,324 +702,6 @@ func TestDB_SyncChunksWALAtCommitBoundary(t *testing.T) {
 	}
 }
 
-func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
-		t.Fatal(err)
-	}
-	for range 5 {
-		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Sync fully with the truncate threshold disabled so the last synced WAL
-	// offset ends up past the threshold without a checkpoint having run.
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	db.mu.RLock()
-	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-
-	db.TruncatePageN = 2
-	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
-	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
-		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
-	}
-
-	for range 20 {
-		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// A single bounded chunk leaves pending WAL frames, but the truncate
-	// threshold has been exceeded so the checkpoint must fire anyway.
-	result, err := db.syncOnce(t.Context(), db.MaxSyncWALBytes)
-	if err != nil {
-		t.Fatal(err)
-	} else if !result.limited {
-		t.Fatal("expected sync to stop at WAL byte limit")
-	}
-
-	db.mu.RLock()
-	syncedOffsetAfter := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-	if db.exceedsTruncateThreshold(syncedOffsetAfter) {
-		t.Fatalf("expected checkpoint during catch-up to restart the wal: offset=%d", syncedOffsetAfter)
-	}
-}
-
-func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
-		t.Fatal(err)
-	}
-	for range 5 {
-		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	db.mu.RLock()
-	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-
-	db.TruncatePageN = 2
-	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
-		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
-	}
-
-	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
-	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
-
-	db.chkMu.RLock()
-	err = db.Sync(t.Context())
-	db.chkMu.RUnlock()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got == 0 {
-		t.Fatal("expected a passive checkpoint attempt before truncate")
-	}
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 0 {
-		t.Fatalf("truncate checkpoints=%v, want 0 after passive restarted the wal", got)
-	}
-
-	db.mu.RLock()
-	restartedOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-	if db.exceedsTruncateThreshold(restartedOffset) {
-		t.Fatalf("expected passive checkpoint to restart the wal: offset=%d", restartedOffset)
-	}
-}
-
-func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.BusyTimeout = 50 * time.Millisecond
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
-		t.Fatal(err)
-	}
-	for range 5 {
-		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	// Hold a read transaction so neither checkpoint mode can restart the WAL.
-	tx, err := sqldb.Begin()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback() }()
-	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
-		t.Fatal(err)
-	}
-
-	db.mu.RLock()
-	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-
-	db.TruncatePageN = 2
-	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
-		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
-	}
-
-	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
-	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
-
-	for range 2 {
-		if err := db.Sync(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 1 {
-		t.Fatalf("passive checkpoints=%v, want 1 across repeated blocked syncs", got)
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 2 {
-		t.Fatalf("truncate checkpoints=%v, want 2 across repeated blocked syncs", got)
-	}
-
-	db.mu.RLock()
-	blockedOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-	if !db.exceedsTruncateThreshold(blockedOffset) {
-		t.Fatalf("expected wal to remain unrestarted while reader is open: offset=%d", blockedOffset)
-	}
-
-	db.TruncatePageN = DefaultTruncatePageN
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	db.TruncatePageN = 2
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 2 {
-		t.Fatalf("passive checkpoints=%v, want 2 after threshold cleared", got)
-	}
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 3 {
-		t.Fatalf("truncate checkpoints=%v, want 3 after threshold cleared", got)
-	}
-
-	if err := tx.Rollback(); err != nil {
-		t.Fatal(err)
-	}
-	db.TruncatePageN = 1
-	if err := db.Checkpoint(t.Context(), CheckpointModePassive); err != nil {
-		t.Fatal(err)
-	}
-
-	db.mu.RLock()
-	restartedOffset := db.syncState.lastSyncedWALOffset
-	db.mu.RUnlock()
-	if !db.exceedsTruncateThreshold(restartedOffset) {
-		t.Fatalf("precondition: restarted wal offset %d must meet the truncate threshold", restartedOffset)
-	}
-
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 4 {
-		t.Fatalf("passive checkpoints=%v, want 4 after wal restart", got)
-	}
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
-		t.Fatalf("truncate checkpoints=%v, want 4 after wal restart", got)
-	}
-}
-
-func TestDB_ExceedsTruncateThreshold(t *testing.T) {
-	const pageSize = 4096
-
-	tests := []struct {
-		name          string
-		truncatePageN int
-		walSize       int64
-		want          bool
-	}{
-		{
-			name:          "configured threshold",
-			truncatePageN: 2,
-			walSize:       calcWALSize(pageSize, 2),
-			want:          true,
-		},
-		{
-			name:          "zero below default threshold",
-			truncatePageN: 0,
-			walSize:       calcWALSize(pageSize, DefaultTruncatePageN) - 1,
-			want:          false,
-		},
-		{
-			name:          "zero at default threshold",
-			truncatePageN: 0,
-			walSize:       calcWALSize(pageSize, DefaultTruncatePageN),
-			want:          true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			db := &DB{pageSize: pageSize, TruncatePageN: tt.truncatePageN}
-			if got := db.exceedsTruncateThreshold(tt.walSize); got != tt.want {
-				t.Fatalf("exceedsTruncateThreshold(%d)=%t, want %t", tt.walSize, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
 	if err != nil {
@@ -1060,7 +742,7 @@ func TestCalcWALSize(t *testing.T) {
 		expected int64
 	}{
 		{
-			name:     "4KB pages, 121359 pages (default TruncatePageN)",
+			name:     "4KB pages, 121359 pages",
 			pageSize: 4096,
 			pageN:    121359,
 			expected: int64(WALHeaderSize) + (int64(WALFrameHeaderSize+4096) * 121359),
@@ -1290,7 +972,7 @@ func TestDB_Checkpoint_UpdatesMetrics(t *testing.T) {
 	baselineSeconds := testutil.ToFloat64(checkpointSecondsCounterVec.WithLabelValues(db.Path(), "PASSIVE"))
 
 	// Force checkpoint
-	if err := db.Checkpoint(context.Background(), "PASSIVE"); err != nil {
+	if err := db.Checkpoint(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1785,7 +1467,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if err := db.execCheckpoint(context.Background()); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -2172,15 +1854,6 @@ func TestDB_releaseReadLock_DoubleRollback(t *testing.T) {
 // The bug: After checkpoint truncates WAL, verify() sees old LTX position
 // is beyond new WAL size and triggers snapshotting=true unnecessarily.
 func TestDB_CheckpointDoesNotTriggerSnapshot(t *testing.T) {
-	t.Run("TruncateMode", func(t *testing.T) {
-		testCheckpointSnapshot(t, CheckpointModeTruncate)
-	})
-	t.Run("PassiveMode", func(t *testing.T) {
-		testCheckpointSnapshot(t, CheckpointModePassive)
-	})
-}
-
-func testCheckpointSnapshot(t *testing.T, mode string) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -2248,10 +1921,10 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	t.Logf("Before checkpoint: verify() snapshotting=%v reason=%q", info1.snapshotting, info1.reason)
 
 	// Perform checkpoint - this may restart the WAL with new salt
-	if err := db.Checkpoint(ctx, mode); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("Checkpoint mode=%s completed", mode)
+	t.Log("Checkpoint completed")
 	posAfterChk, _ := db.Pos()
 	t.Logf("After checkpoint: TXID=%d", posAfterChk.TXID)
 
@@ -2345,7 +2018,7 @@ func TestDB_MultipleCheckpointsWithWrites(t *testing.T) {
 		}
 
 		// Checkpoint
-		if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		if err := db.Checkpoint(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -2546,7 +2219,7 @@ func TestDB_IdleCheckpointSnapshotLoop(t *testing.T) {
 	}
 
 	// Force a checkpoint that will reset WAL salt
-	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
 	afterCheckpointPos, _ := db.Pos()
@@ -2629,7 +2302,7 @@ func TestDB_Issue994_RunawayDiskUsage(t *testing.T) {
 	}
 
 	// Force a checkpoint (mirrors what happens in production after bulk writes).
-	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3090,7 +2763,7 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+	if err := db.Checkpoint(ctx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3150,140 +2823,15 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }
 
-// TestDB_CheckpointCreatesSnapshotL0 verifies that TRUNCATE checkpoints
-// create a full snapshot L0 to guarantee complete page coverage.
-//
-// After a TRUNCATE checkpoint restarts the WAL, there's a TOCTOU gap where
-// application commits can arrive between releasing the write lock and the
-// checkpoint executing. Those frames get checkpointed from WAL to DB but
-// are never captured in an L0 file. The post-checkpoint snapshot ensures
-// all pages are captured. See issues #927, #1198.
-func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.CheckpointInterval = 0
-	db.MinCheckpointPageN = 1000000
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
-
-	// Initial sync
-	if err := db.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Write data to grow WAL
-	for i := range 50 {
-		blob := make([]byte, 2000)
-		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	// Sync all frames
-	if err := db.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Record L0 file count before checkpoint
-	l0Dir := db.LTXLevelDir(0)
-	l0BeforeEntries, _ := os.ReadDir(l0Dir)
-	l0BeforeNames := make(map[string]bool)
-	for _, e := range l0BeforeEntries {
-		l0BeforeNames[e.Name()] = true
-	}
-
-	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
-	// complete page coverage across the checkpoint boundary.
-	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
-		t.Fatal(err)
-	}
-
-	// Verify a snapshot L0 was created during checkpoint. A TRUNCATE
-	// checkpoint reports zero frame counts, so it cannot prove that no
-	// commits landed between the pre-checkpoint sync and the checkpoint;
-	// it must take the boundary snapshot unconditionally. An incremental
-	// (non-snapshot) L0 here would silently drop those commits.
-	l0AfterEntries, _ := os.ReadDir(l0Dir)
-	newL0Count, newSnapshotCount := 0, 0
-	for _, entry := range l0AfterEntries {
-		if l0BeforeNames[entry.Name()] {
-			continue
-		}
-		newL0Count++
-
-		f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
-		if err != nil {
-			t.Fatal(err)
-		}
-		dec := ltx.NewDecoder(f)
-		if err := dec.DecodeHeader(); err != nil {
-			f.Close()
-			t.Fatalf("decode header %s: %v", entry.Name(), err)
-		}
-		hdr := dec.Header()
-		pageCount := 0
-		pageData := make([]byte, hdr.PageSize)
-		for {
-			var phdr ltx.PageHeader
-			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
-				break
-			} else if err != nil {
-				f.Close()
-				t.Fatalf("decode page %s: %v", entry.Name(), err)
-			}
-			pageCount++
-		}
-		f.Close()
-
-		// A boundary snapshot contains every page up to the commit.
-		if uint32(pageCount) == hdr.Commit {
-			newSnapshotCount++
-		}
-	}
-	if newL0Count == 0 {
-		t.Fatal("expected checkpoint to create at least one new L0 file")
-	}
-	if newSnapshotCount == 0 {
-		t.Fatal("expected TRUNCATE checkpoint to create a boundary snapshot L0")
-	}
-}
-
 // TestDB_CheckpointPageGapWithConcurrentWrites verifies that pages written
 // concurrently with checkpoint execution are not lost.
 //
-// Root cause: checkpoint() does a pre-checkpoint sync to capture WAL state,
-// then executes PRAGMA wal_checkpoint(TRUNCATE). Under concurrent writes,
-// new commits can arrive between the pre-sync and the checkpoint. These commits
-// are checkpointed (moved from WAL to DB file) and then the WAL is truncated.
-// The post-checkpoint sync reads only the NEW WAL — the missed pages are in
-// the DB file but not in any L0 file. When compaction merges L0 files into
+// Root cause: a checkpoint does a pre-checkpoint sync to capture WAL state,
+// then executes PRAGMA wal_checkpoint. Under concurrent writes, new commits
+// can arrive between the pre-sync and the checkpoint. Unless the barrier seals
+// them first, these commits are checkpointed (moved from WAL to DB file) and
+// the WAL restarts. The post-checkpoint sync reads only the NEW WAL — the
+// missed pages are in the DB file but not in any L0 file. When compaction merges L0 files into
 // a snapshot (MinTXID=1), the missing pages cause "nonsequential page numbers".
 //
 // This test exercises the race by:
@@ -3400,7 +2948,7 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	}
 	checkpointDeadline := time.Now().Add(5 * time.Second)
 	for {
-		err := db.Checkpoint(ctx, CheckpointModeTruncate)
+		err := db.Checkpoint(ctx)
 		if err == nil {
 			break
 		}
@@ -4368,7 +3916,6 @@ func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
 	runSyncRestoreIntegrity(t, syncRestoreIntegrityConfig{
 		configure: func(db *DB) {
 			db.MinCheckpointPageN = 20
-			db.TruncatePageN = 200
 			db.CheckpointInterval = 50 * time.Millisecond
 		},
 		schema:     `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, extra BLOB)`,
@@ -4551,10 +4098,10 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 				return
 			default:
 			}
-			// TRUNCATE resets the WAL so subsequent snapshots must read
-			// cold pages from the database file — the path that exposes
-			// a checkpoint racing the position capture.
-			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+			// A checkpoint folds the WAL into the database file so
+			// subsequent snapshots must read cold pages from it — the
+			// path that exposes a checkpoint racing the position capture.
+			if err := db.Checkpoint(ctx); err != nil {
 				if !isSQLiteBusyError(err) {
 					errCh <- err
 					return
@@ -4752,7 +4299,7 @@ func TestDB_ReadLockSurvivesContextCancel(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+		if err := db.execCheckpoint(ctx); err != nil {
 			t.Fatal(err)
 		}
 		cancel()
@@ -4819,7 +4366,7 @@ func TestDB_CloseDeletesMetrics(t *testing.T) {
 		path := filepath.Join(dir, name)
 		db := mustOpenMetricsDB(t, path)
 		mustWriteAndSyncMetricsDB(t, db)
-		if err := db.Checkpoint(context.Background(), CheckpointModePassive); err != nil {
+		if err := db.Checkpoint(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 		if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
@@ -5114,7 +4661,6 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 			db.MonitorInterval = 0
 			db.CheckpointInterval = 0
 			db.MinCheckpointPageN = 1 << 30
-			db.TruncatePageN = 1 << 30
 			db.Replica = NewReplica(db)
 			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
 			db.Replica.MonitorEnabled = false
@@ -5174,7 +4720,7 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 					assertCached()
 				},
 			})
-			if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+			if err := db.Checkpoint(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if barriers == 0 {
