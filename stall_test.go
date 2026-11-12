@@ -59,6 +59,7 @@ func TestStore_SyncEndsOnceItsUploadStopsMoving(t *testing.T) {
 
 	_, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false)
 	ended := time.Now()
+	db.Replica.Client = client.ReplicaClient
 
 	if !errors.Is(err, ErrStalled) {
 		t.Fatalf("sync error = %v, want %v", err, ErrStalled)
