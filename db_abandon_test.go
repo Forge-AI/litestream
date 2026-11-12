@@ -67,7 +67,7 @@ func TestDB_AbandonPublishesItsPositionWithoutSyncing(t *testing.T) {
 	require.True(t, published.Unsynced)
 
 	checkpointed := make(chan error, 1)
-	go func() { checkpointed <- db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate) }()
+	go func() { checkpointed <- db.Checkpoint(t.Context()) }()
 	select {
 	case err := <-checkpointed:
 		t.Fatalf("a checkpoint ran after the abandon: %v", err)

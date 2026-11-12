@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -62,7 +63,7 @@ func TestDB_SnapshotAfterWALRewind(t *testing.T) {
 			// tables, so every page so far is in the database file.
 			db := openDBWithReplicaDir(t, path, replicaDir)
 			sync(db)
-			if err := db.Checkpoint(ctx, litestream.CheckpointModeTruncate); err != nil {
+			if err := db.Checkpoint(ctx); err != nil {
 				t.Fatal(err)
 			}
 			for i := range 5 {
@@ -74,7 +75,7 @@ func TestDB_SnapshotAfterWALRewind(t *testing.T) {
 				}
 			}
 			sync(db)
-			durableWALSize := fileSize(t, db.WALPath())
+			durableWALSize := walEnd(t, db.WALPath())
 
 			// Shipped by Litestream, then lost in the power cut.
 			for i := range 10 {
@@ -84,7 +85,7 @@ func TestDB_SnapshotAfterWALRewind(t *testing.T) {
 			if err := db.Replica.Sync(ctx); err != nil {
 				t.Fatal(err)
 			}
-			staleOffset := fileSize(t, db.WALPath())
+			staleOffset := walEnd(t, db.WALPath())
 			salt := walSalt(t, db.WALPath())
 
 			// Copy before closing: the last close checkpoints and removes the WAL.
@@ -217,6 +218,22 @@ func fileSize(tb testing.TB, path string) int64 {
 		tb.Fatal(err)
 	}
 	return fi.Size()
+}
+
+// walEnd returns the offset past the last frame of the WAL's current
+// generation; a restarted WAL keeps the older generation's frames beyond it.
+func walEnd(tb testing.TB, path string) int64 {
+	tb.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	frameSize := int64(binary.BigEndian.Uint32(b[8:12])) + litestream.WALFrameHeaderSize
+	end := int64(litestream.WALHeaderSize)
+	for end+frameSize <= int64(len(b)) && bytes.Equal(b[end+8:end+16], b[16:24]) {
+		end += frameSize
+	}
+	return end
 }
 
 func walSalt(tb testing.TB, path string) []byte {
