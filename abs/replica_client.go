@@ -254,6 +254,10 @@ func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error
 	return io.ReadAll(resp.Body)
 }
 
+func (c *ReplicaClient) PageMapKey() string {
+	return path.Join(c.Path, litestream.PageMapName)
+}
+
 // WriteLTXFile writes an LTX file to remote storage.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {

@@ -108,6 +108,7 @@ type DB struct {
 	owe        func(level int)
 	pay        func(ctx context.Context)
 	paying     sync.Mutex
+	pageMap    pageMapState
 	registered bool
 
 	ctx    context.Context
@@ -3349,7 +3350,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 		}
 	}
 
-	return info, nil
+	return info, db.writePageMap(ctx, info)
 }
 
 // Snapshot writes a snapshot to the replica for the current database position.
@@ -3376,7 +3377,10 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.m[SnapshotLevel] = info
 	db.maxLTXFileInfos.Unlock()
 
-	return info, db.nameCompacted(info)
+	if err := db.nameCompacted(info); err != nil {
+		return info, err
+	}
+	return info, db.writePageMap(ctx, info)
 }
 
 func (db *DB) nameCompacted(info *ltx.FileInfo) error {

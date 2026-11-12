@@ -784,6 +784,10 @@ func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error
 	return io.ReadAll(out.Body)
 }
 
+func (c *ReplicaClient) PageMapKey() string {
+	return c.Path + "/" + litestream.PageMapName
+}
+
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
 // Objects smaller than the part size are written with a single PutObject call
