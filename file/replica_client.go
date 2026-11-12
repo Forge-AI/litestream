@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -172,6 +173,36 @@ func (c *ReplicaClient) ReadHead(_ context.Context, key string) ([]byte, error) 
 
 func (c *ReplicaClient) PageMapKey() string {
 	return filepath.Join(c.path, litestream.PageMapName)
+}
+
+// ObjectKey returns the full path of a small object of this replica.
+func (c *ReplicaClient) ObjectKey(name string) string {
+	return filepath.Join(c.path, name)
+}
+
+// ListHeads lists the full paths of the small objects in dir.
+func (c *ReplicaClient) ListHeads(_ context.Context, dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, entry := range entries {
+		if entry.Type().IsRegular() && !strings.HasSuffix(entry.Name(), ".tmp") {
+			keys = append(keys, filepath.Join(dir, entry.Name()))
+		}
+	}
+	return keys, nil
+}
+
+// DeleteHead deletes one small object at a full path.
+func (c *ReplicaClient) DeleteHead(_ context.Context, key string) error {
+	if err := os.Remove(key); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // WriteLTXFile writes an LTX file to the replica.

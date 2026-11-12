@@ -258,6 +258,42 @@ func (c *ReplicaClient) PageMapKey() string {
 	return path.Join(c.Path, litestream.PageMapName)
 }
 
+// ObjectKey returns the full key of a small object of this replica.
+func (c *ReplicaClient) ObjectKey(name string) string {
+	return path.Join(c.Path, name)
+}
+
+// ListHeads lists the full keys of the small objects under dir.
+func (c *ReplicaClient) ListHeads(ctx context.Context, dir string) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	prefix := dir + "/"
+	var keys []string
+	pager := c.client.NewListBlobsFlatPager(c.Bucket, &azblob.ListBlobsFlatOptions{Prefix: &prefix})
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("abs: list heads %s: %w", dir, err)
+		}
+		for _, item := range resp.Segment.BlobItems {
+			keys = append(keys, *item.Name)
+		}
+	}
+	return keys, nil
+}
+
+// DeleteHead deletes one small object at a full key.
+func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	if _, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil); err != nil && !isNotExists(err) {
+		return fmt.Errorf("abs: delete head %s: %w", key, err)
+	}
+	return nil
+}
+
 // WriteLTXFile writes an LTX file to remote storage.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {

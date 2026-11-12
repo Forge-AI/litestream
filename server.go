@@ -81,6 +81,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /register-driven", s.handleRegisterDriven)
 	mux.HandleFunc("POST /unregister", s.handleUnregister)
 	mux.HandleFunc("POST /sync", s.handleSync)
+	mux.HandleFunc("POST /hold", s.handleHold)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 	mux.HandleFunc("GET /debug/sync-status", s.handleSyncStatus)
@@ -497,6 +498,60 @@ type SyncResponse struct {
 	Path           string `json:"path"`
 	TXID           uint64 `json:"txid"`
 	ReplicatedTXID uint64 `json:"replicated_txid"`
+}
+
+func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
+	var req HoldRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+	if req.Path == "" || req.Name == "" || req.ChildBase == "" {
+		writeJSONError(w, http.StatusBadRequest, "path, name and child_base required", nil)
+		return
+	}
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusNotFound, "database not found", nil)
+		return
+	}
+	if !db.IsOpen() {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("%s: %s", ErrDatabaseNotOpen, expandedPath), nil)
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer context.AfterFunc(s.ctx, cancel)()
+	switch err := db.compactor.Hold(ctx, req.Name, req.Hold); {
+	case err == nil:
+		writeJSON(w, http.StatusOK, HoldResponse{Status: "held", Path: expandedPath, Name: req.Name})
+	case errors.Is(err, ErrHeldFileGone):
+		writeJSONError(w, http.StatusGone, err.Error(), nil)
+	case isRefused(err):
+		writeJSONError(w, http.StatusForbidden, err.Error(), nil)
+	default:
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+	}
+}
+
+// HoldRequest is the request body for the /hold endpoint: it keeps the files
+// a child database's base record reads from this database's replica.
+type HoldRequest struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Hold
+}
+
+// HoldResponse is the response body for the /hold endpoint.
+type HoldResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
