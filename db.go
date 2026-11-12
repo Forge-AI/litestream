@@ -994,6 +994,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.VerifyCompaction = db.VerifyCompaction
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
+	db.compactor.forgetHolds()
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 && !db.SyncDriven {
@@ -3448,9 +3449,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	}
 
 	// Remove files marked for deletion from remote storage (unless retention disabled).
-	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := db.compactor.deleteRemote(ctx, SnapshotLevel, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -3584,9 +3583,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := db.compactor.deleteRemote(ctx, 0, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 

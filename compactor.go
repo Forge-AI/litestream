@@ -51,6 +51,8 @@ type Compactor struct {
 	// CacheSetter optionally stores MaxLTXFileInfo for a level.
 	// If nil, max file info is not cached.
 	CacheSetter func(level int, info *ltx.FileInfo)
+
+	holds holdState
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -267,9 +269,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
-	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := c.deleteRemote(ctx, SnapshotLevel, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -315,9 +315,7 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
-	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := c.deleteRemote(ctx, level, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -403,9 +401,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 		return nil
 	}
 
-	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
-	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := c.deleteRemote(ctx, 0, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
