@@ -921,7 +921,7 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 		}
 	}
 
-	if minSnapshotTXID == 0 {
+	if minSnapshotTXID == 0 || !db.RetentionEnabled {
 		return nil
 	}
 	return db.compactor.DropBase(ctx)

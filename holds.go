@@ -94,7 +94,7 @@ func (c *Compactor) Hold(ctx context.Context, name string, hold Hold) error {
 // DropBase deletes this replica's base record unless a live hold names it.
 func (c *Compactor) DropBase(ctx context.Context) error {
 	client, ok := c.client.(HoldClient)
-	if !c.RetentionEnabled || !ok {
+	if !ok {
 		return nil
 	}
 	c.holds.mu.Lock()
@@ -109,18 +109,14 @@ func (c *Compactor) DropBase(ctx context.Context) error {
 	return nil
 }
 
-func (c *Compactor) deleteRemote(ctx context.Context, level int, files []*ltx.FileInfo) error {
-	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(files))
-		return nil
-	}
-	client, ok := c.client.(HoldClient)
+func (c *Compactor) deleteUnheld(ctx context.Context, client ReplicaClient, files []*ltx.FileInfo) error {
+	holdClient, ok := client.(HoldClient)
 	if !ok || len(files) == 0 {
-		return c.client.DeleteLTXFiles(ctx, files)
+		return client.DeleteLTXFiles(ctx, files)
 	}
 	c.holds.mu.Lock()
 	defer c.holds.mu.Unlock()
-	held, err := c.liveHolds(ctx, client, func(h Hold) bool { return slices.ContainsFunc(files, h.names) })
+	held, err := c.liveHolds(ctx, holdClient, func(h Hold) bool { return slices.ContainsFunc(files, h.names) })
 	if err != nil {
 		return err
 	}
@@ -131,9 +127,9 @@ func (c *Compactor) deleteRemote(ctx context.Context, level int, files []*ltx.Fi
 		}
 	}
 	if kept := len(files) - len(unheld); kept > 0 {
-		c.logger.Info("retention kept held files", "level", level, "kept", kept)
+		c.logger.Info("retention kept held files", "kept", kept)
 	}
-	return c.client.DeleteLTXFiles(ctx, unheld)
+	return client.DeleteLTXFiles(ctx, unheld)
 }
 
 func (c *Compactor) liveHolds(ctx context.Context, client HoldClient, match func(Hold) bool) ([]Hold, error) {

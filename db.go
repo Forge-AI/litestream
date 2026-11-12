@@ -3449,7 +3449,9 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	}
 
 	// Remove files marked for deletion from remote storage (unless retention disabled).
-	if err := db.compactor.deleteRemote(ctx, SnapshotLevel, deleted); err != nil {
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -3583,7 +3585,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if err := db.compactor.deleteRemote(ctx, 0, deleted); err != nil {
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
