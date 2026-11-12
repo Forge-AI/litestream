@@ -531,12 +531,16 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 	phase.Store("is_open")
 	var deadline sync.Once
 	warnDeadline := func() {
-		if !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		msg := "database sync deadline exceeded"
+		switch cause := context.Cause(ctx); {
+		case errors.Is(cause, ErrStalled):
+			msg = "database sync moved no bytes for its stall window"
+		case !errors.Is(cause, context.DeadlineExceeded):
 			return
 		}
 		deadline.Do(func() {
 			holder := db.SyncDiagnostic()
-			db.Logger.Warn("database sync deadline exceeded",
+			db.Logger.Warn(msg,
 				"binary", "litestream-next",
 				"path", path,
 				"request_phase", phase.Load().(string),

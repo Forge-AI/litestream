@@ -256,7 +256,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, movingFile{f: f, db: r.db})
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
