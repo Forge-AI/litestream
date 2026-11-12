@@ -47,7 +47,7 @@ const (
 // DB represents a managed instance of a SQLite database in the file system.
 //
 // Checkpoint Strategy:
-// Litestream checkpoints only in PASSIVE mode, on two triggers:
+// A DB checkpoints only in PASSIVE mode, on two triggers:
 //
 //  1. MinCheckpointPageN: Non-blocking checkpoint at ~1k pages (~4MB).
 //     Attempts checkpoint but allows concurrent readers/writers.
