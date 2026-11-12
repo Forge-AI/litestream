@@ -170,6 +170,10 @@ func (c *ReplicaClient) ReadHead(_ context.Context, key string) ([]byte, error) 
 	return os.ReadFile(key)
 }
 
+func (c *ReplicaClient) PageMapKey() string {
+	return filepath.Join(c.path, litestream.PageMapName)
+}
+
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and sets it as the file's ModTime to preserve original creation time.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
