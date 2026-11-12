@@ -158,6 +158,11 @@ type DB struct {
 	// Set to 0 to disable time-based checkpoints.
 	CheckpointInterval time.Duration
 
+	// Unix socket that fetches an absent segment of a lazy copy, one whose
+	// "-segments" map still exists, before a page in it is read or
+	// checkpointed. Empty disables faulting.
+	FaultSocket string
+
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
 
@@ -3010,6 +3015,11 @@ func (db *DB) logFullSnapshotEnd(txID ltx.TXID, reason string, elapsed time.Dura
 func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
+	faults, err := db.segmentFaults()
+	if err != nil {
+		return err
+	}
+	defer faults.close()
 
 	for pgno := uint32(1); pgno <= commit; pgno++ {
 		if pgno == lockPgno {
@@ -3021,6 +3031,9 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *o
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		default:
+		}
+		if err := faults.ensure(ctx, pgno); err != nil {
+			return err
 		}
 
 		// If page exists in the WAL, read from there.
@@ -3082,12 +3095,20 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *
 	}
 	slices.Sort(pgnos)
 
+	faults, err := db.segmentFaults()
+	if err != nil {
+		return err
+	}
+	defer faults.close()
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		default:
+		}
+		if err := faults.ensure(ctx, pgno); err != nil {
+			return err
 		}
 		if offset, ok := pageMap[pgno]; ok {
 			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
