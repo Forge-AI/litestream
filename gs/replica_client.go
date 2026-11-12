@@ -153,6 +153,34 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return newLTXFileIterator(c.bkt.Objects(ctx, query), c, level), nil
 }
 
+// WriteHead writes one small object at a full key.
+func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	w := c.bkt.Object(key).NewWriter(ctx)
+	if _, err := w.Write(text); err != nil {
+		_ = w.Close()
+		return err
+	}
+	return w.Close()
+}
+
+// ReadHead reads one small object at a full key.
+func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	r, err := c.bkt.Object(key).NewReader(ctx)
+	if isNotExists(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+	return io.ReadAll(r)
+}
+
 // WriteLTXFile writes an LTX file from rd to a remote path.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {

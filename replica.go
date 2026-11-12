@@ -50,6 +50,10 @@ type Replica struct {
 	// Client used to connect to the remote replica.
 	Client ReplicaClient
 
+	// HeadKey is the full key of the chat's head object; empty writes none.
+	HeadKey string
+	head    headState
+
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
 
@@ -194,6 +198,12 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			slog.String("db", dpos.TXID.String()),
 		))
 
+	if r.Pos().TXID >= dpos.TXID {
+		r.headCaughtUp(ctx)
+	} else if err := r.headMoves(ctx); err != nil {
+		return result, err
+	}
+
 	// Replicate all L0 LTX files since last replica position.
 	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
 		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
@@ -219,6 +229,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			return result, err
 		}
 		r.SetPos(ltx.Pos{TXID: uploaded})
+		r.headUploaded()
 		r.db.owe(1)
 		result.synced = true
 		syncedFileN++
