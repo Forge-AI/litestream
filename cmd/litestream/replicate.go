@@ -407,6 +407,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		c.Server.SocketPerms = c.Config.Socket.Permissions
 		c.Server.PathExpander = expand
 		c.Server.Version = Version
+		if c.Server.Listener, err = inheritedListener(); err != nil {
+			return err
+		}
 		if err := c.Server.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}
