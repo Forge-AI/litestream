@@ -150,6 +150,67 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return newLTXFileIterator(c.bkt.Objects(ctx, query), c, level), nil
 }
 
+// WriteHead writes one small object at a full key.
+func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	w := c.bkt.Object(key).NewWriter(ctx)
+	if _, err := w.Write(text); err != nil {
+		_ = w.Close()
+		return err
+	}
+	return w.Close()
+}
+
+// ReadHead reads one small object at a full key.
+func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	r, err := c.bkt.Object(key).NewReader(ctx)
+	if isNotExists(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, err
+	}
+	defer func() { _ = r.Close() }()
+	return io.ReadAll(r)
+}
+
+// ObjectKey returns the full key of a small object of this replica.
+func (c *ReplicaClient) ObjectKey(name string) string {
+	return path.Join(c.Path, name)
+}
+
+// ListHeads lists the full keys of the small objects under dir.
+func (c *ReplicaClient) ListHeads(ctx context.Context, dir string) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	var keys []string
+	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}); ; {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			return keys, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("gs: list heads %s: %w", dir, err)
+		}
+		keys = append(keys, attrs.Name)
+	}
+}
+
+// DeleteHead deletes one small object at a full key.
+func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
+		return fmt.Errorf("gs: delete head %s: %w", key, err)
+	}
+	return nil
+}
+
 // WriteLTXFile writes an LTX file from rd to a remote path.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
