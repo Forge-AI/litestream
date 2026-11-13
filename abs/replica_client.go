@@ -216,6 +216,66 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return newLTXFileIterator(ctx, c, level, seek), nil
 }
 
+// WriteHead writes one small object at a full key.
+func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	_, err := c.client.UploadBuffer(ctx, c.Bucket, key, text, nil)
+	return err
+}
+
+// ReadHead reads one small object at a full key.
+func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, nil)
+	if isNotExists(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return io.ReadAll(resp.Body)
+}
+
+// ObjectKey returns the full key of a small object of this replica.
+func (c *ReplicaClient) ObjectKey(name string) string {
+	return path.Join(c.Path, name)
+}
+
+// ListHeads lists the full keys of the small objects under dir.
+func (c *ReplicaClient) ListHeads(ctx context.Context, dir string) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	prefix := dir + "/"
+	var keys []string
+	pager := c.client.NewListBlobsFlatPager(c.Bucket, &azblob.ListBlobsFlatOptions{Prefix: &prefix})
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("abs: list heads %s: %w", dir, err)
+		}
+		for _, item := range resp.Segment.BlobItems {
+			keys = append(keys, *item.Name)
+		}
+	}
+	return keys, nil
+}
+
+// DeleteHead deletes one small object at a full key.
+func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	if _, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil); err != nil && !isNotExists(err) {
+		return fmt.Errorf("abs: delete head %s: %w", key, err)
+	}
+	return nil
+}
+
 // WriteLTXFile writes an LTX file to remote storage.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
