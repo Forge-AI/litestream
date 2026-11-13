@@ -178,6 +178,11 @@ type DB struct {
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
 
+	// BaseTXID is the TXID through which the database's base record reads its
+	// parent's files, so the replica holds its history that far with no file
+	// of its own. Must be set before calling Open().
+	BaseTXID ltx.TXID
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -1904,7 +1909,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 	if db.Replica.AutoRecoverEnabled {
 		db.setSyncDiagPhase(diagPhaseInitUploadFiles)
-		if err := db.verifyUploadFiles(replicaInfo.MaxTXID); db.recoversFrom(err) {
+		if err := db.verifyUploadFiles(max(replicaInfo.MaxTXID, db.BaseTXID)); db.recoversFrom(err) {
 			if dbPos, err = db.discardUploadFiles(err); err != nil {
 				return err
 			}

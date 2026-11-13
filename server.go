@@ -221,6 +221,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		status = "already_running"
 	} else {
 		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
+		db.BaseTXID = ltx.TXID(req.BaseTXID)
 		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
 			db.SetHandover(Handover{})
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
@@ -396,6 +397,7 @@ type StartRequest struct {
 	Timeout      int    `json:"timeout,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL  WALEnd `json:"handover_wal"`
+	BaseTXID     uint64 `json:"base_txid,omitempty"`
 }
 
 // StartResponse is the response body for the /start endpoint.
@@ -657,6 +659,7 @@ type RegisterDatabaseRequest struct {
 	Head              string `json:"head,omitempty"`
 	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL       WALEnd `json:"handover_wal"`
+	BaseTXID          uint64 `json:"base_txid,omitempty"`
 	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
 	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
 }
@@ -671,6 +674,7 @@ type RegisterDrivenRequest struct {
 	Head         string `json:"head,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL  WALEnd `json:"handover_wal"`
+	BaseTXID     uint64 `json:"base_txid,omitempty"`
 	Retention    *bool  `json:"retention,omitempty"`
 	AutoRecover  bool   `json:"auto_recover,omitempty"`
 }
@@ -736,6 +740,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create new database.
 	db := NewDB(expandedPath)
+	db.BaseTXID = ltx.TXID(req.BaseTXID)
 	if req.HandoverTXID != 0 {
 		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 	}
@@ -820,6 +825,7 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 
 	db := NewDB(expandedPath)
 	db.SyncDriven = true
+	db.BaseTXID = ltx.TXID(req.BaseTXID)
 	if req.Retention != nil {
 		db.RetentionEnabled = *req.Retention
 	}

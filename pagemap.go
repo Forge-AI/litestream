@@ -240,6 +240,9 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
 	}
 
 	plan := planPageMap(s.known, txID)
+	if plan == nil && s.current == nil && db.BaseTXID > 0 {
+		return nil
+	}
 	if plan == nil {
 		var err error
 		if plan, err = CalcRestorePlan(ctx, db.Replica.Client, txID, time.Time{}, db.Logger); err != nil {
