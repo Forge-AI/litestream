@@ -2207,6 +2207,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (syncI
 		salt2:               binary.BigEndian.Uint32(hdr[20:]),
 		prevCommit:          info.prevCommit,
 		clearSyncedToWALEnd: true,
+		ltxEnd:              info.ltxEnd,
 	}, nil
 }
 
@@ -2242,6 +2243,7 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
 	info.prevCommit = dec.Header().Commit
+	info.ltxEnd = walPosition{Salt1: info.salt1, Salt2: info.salt2, Offset: info.offset}
 	if info.offset < WALHeaderSize {
 		info.offset = WALHeaderSize
 		info.reason = "last ltx file holds no wal position, snapshotting"
@@ -2471,6 +2473,7 @@ type syncInfo struct {
 	snapshotting        bool   // if true, a full snapshot is required
 	reason              string // reason for snapshot
 	clearSyncedToWALEnd bool
+	ltxEnd              walPosition
 }
 
 type syncResult struct {
@@ -2581,7 +2584,34 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
-func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, err error) {
+func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (syncResult, error) {
+	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
+	if !checkpointing {
+		db.chkMu.RLock()
+		defer db.chkMu.RUnlock()
+	}
+
+	var synced bool
+	for {
+		prior := exec.pos
+		result, span, err := db.syncSpan(ctx, checkpointing, exec, info, maxSyncWALBytes)
+		if err != nil {
+			return result, err
+		}
+		exec.applySyncResult(result)
+		if err := db.settleCuts(span, info, prior, result.pos); err != nil {
+			return result, fmt.Errorf("settle cuts: %w", err)
+		}
+		synced = synced || result.synced
+		if span.next == nil {
+			result.synced = synced
+			return result, nil
+		}
+		info = *span.next
+	}
+}
+
+func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, span walSpan, err error) {
 	if info.snapshotting {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
@@ -2624,22 +2654,16 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 	db.Logger.Debug("sync", logArgs...)
 
-	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
-	if !checkpointing {
-		db.chkMu.RLock()
-		defer db.chkMu.RUnlock()
-	}
-
 	fi, err := db.f.Stat()
 	if err != nil {
-		return result, err
+		return result, span, err
 	}
 	mode := fi.Mode()
 	commit := uint32(fi.Size() / int64(db.pageSize))
 
 	walFile, err := os.Open(db.WALPath())
 	if err != nil {
-		return result, err
+		return result, span, err
 	}
 	defer walFile.Close()
 
@@ -2647,7 +2671,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	var rd *WALReader
 	if info.offset == WALHeaderSize {
 		if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
-			return result, fmt.Errorf("new wal reader: %w", err)
+			return result, span, fmt.Errorf("new wal reader: %w", err)
 		}
 	} else {
 		// If we cannot verify the previous frame
@@ -2656,10 +2680,10 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			db.Logger.Log(ctx, internal.LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
 			info.offset = WALHeaderSize
 			if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
-				return result, fmt.Errorf("new wal reader, after reset")
+				return result, span, fmt.Errorf("new wal reader, after reset")
 			}
 		} else if err != nil {
-			return result, fmt.Errorf("new wal reader with offset: %w", err)
+			return result, span, fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
 
@@ -2673,13 +2697,38 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if info.snapshotting {
 		maxSyncWALBytes = 0
 	}
+	begin := *rd
 	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes)
 	if err != nil {
-		return result, fmt.Errorf("page map: %w", err)
+		return result, span, fmt.Errorf("page map: %w", err)
+	}
+	span.start = walPosition{Salt1: rd.salt1, Salt2: rd.salt2, Offset: info.offset}
+	span.end = span.start
+	if maxOffset > 0 {
+		span.end.Offset = maxOffset
+	}
+	if span.cuts, err = db.pendingCuts(); err != nil {
+		return result, span, err
+	}
+	land := span.end.Offset
+	for _, cut := range span.cuts {
+		if cut.at.sameWAL(span.start) && cut.at.Offset > span.start.Offset && cut.at.Offset < land {
+			land = cut.at.Offset
+		}
+	}
+	scanned := span.end.Offset
+	if land < scanned && !info.snapshotting {
+		if pageMap, maxOffset, walCommit, limited, err = begin.pageMap(ctx, land-info.offset); err != nil {
+			return result, span, fmt.Errorf("page map to cut: %w", err)
+		}
+		span.end.Offset = maxOffset
 	}
 	result.limited = limited
 	if walCommit > 0 {
 		commit = walCommit
+	}
+	if span.end.Offset < scanned {
+		span.next = &syncInfo{offset: span.end.Offset, salt1: rd.salt1, salt2: rd.salt2, prevCommit: commit}
 	}
 	var sz int64
 	if maxOffset > 0 {
@@ -2702,23 +2751,23 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	// Exit if we have no new WAL pages and we aren't snapshotting.
 	if !info.snapshotting && sz == 0 {
 		db.Logger.Log(ctx, internal.LevelTrace, "sync: skip", "reason", "no new wal pages")
-		return result, nil
+		return result, span, nil
 	}
 
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-mkdir", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-mkdir", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, err
+		return result, span, err
 	}
 
 	ltxFile, err := db.openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-open", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-open", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, fmt.Errorf("open temp ltx file: %w", err)
+		return result, span, fmt.Errorf("open temp ltx file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
 	defer func() { _ = ltxFile.Close() }()
@@ -2737,7 +2786,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	timestamp := time.Now()
 	enc, err := ltx.NewEncoder(ltxFile)
 	if err != nil {
-		return result, fmt.Errorf("new ltx encoder: %w", err)
+		return result, span, fmt.Errorf("new ltx encoder: %w", err)
 	}
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
@@ -2753,9 +2802,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		WALSalt2:  rd.salt2,
 	}); err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, fmt.Errorf("encode ltx header: %w", err)
+		return result, span, fmt.Errorf("encode ltx header: %w", err)
 	}
 
 	pageEncoder := &verifyingLTXEncoder{Encoder: enc}
@@ -2782,9 +2831,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromDB(ctx, pageEncoder, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+				return result, span, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
-			return result, fmt.Errorf("write ltx from db: %w", err)
+			return result, span, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
 		db.setSyncDiagPhase(diagPhaseWriteLTXFromWAL,
@@ -2796,9 +2845,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromWAL(ctx, pageEncoder, walFile, info.prevCommit, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+				return result, span, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
-			return result, fmt.Errorf("write ltx from wal: %w", err)
+			return result, span, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
 
@@ -2809,9 +2858,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := enc.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, fmt.Errorf("close ltx encoder: %w", err)
+		return result, span, fmt.Errorf("close ltx encoder: %w", err)
 	}
 
 	// Sync & close LTX file.
@@ -2821,20 +2870,20 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := ltxFile.Sync(); err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-sync", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-sync", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, fmt.Errorf("sync ltx file: %w", err)
+		return result, span, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			return result, span, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
-		return result, fmt.Errorf("close ltx file: %w", err)
+		return result, span, fmt.Errorf("close ltx file: %w", err)
 	}
 
 	if info.snapshotting {
 		if err := db.abandoned.Err(); err != nil {
-			return result, err
+			return result, span, err
 		}
 	}
 
@@ -2848,14 +2897,14 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
 		db.maxLTXFileInfos.Unlock()
 		db.invalidatePosCache()
-		return result, fmt.Errorf("rename ltx file: %w", err)
+		return result, span, fmt.Errorf("rename ltx file: %w", err)
 	}
 	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
 		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
 		db.maxLTXFileInfos.Unlock()
 		db.invalidatePosCache()
-		return result, fmt.Errorf("sync ltx dir: %w", err)
+		return result, span, fmt.Errorf("sync ltx dir: %w", err)
 	}
 
 	db.lastLTXPage = nil
@@ -2901,7 +2950,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 
 	db.Logger.Debug("db sync", "status", "ok")
 
-	return result, nil
+	return result, span, nil
 }
 
 func (db *DB) logFullSnapshotEnd(txID ltx.TXID, reason string, elapsed time.Duration, result syncResult, err error) {
