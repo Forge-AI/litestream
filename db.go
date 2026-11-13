@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -72,6 +73,7 @@ type DB struct {
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+	moved     atomic.Int64
 	handover  handoverClaim
 
 	pendingFullSnapshots sync.Map
@@ -175,6 +177,11 @@ type DB struct {
 	// during retention enforcement. When false, cloud provider lifecycle
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
+
+	// BaseTXID is the TXID through which the database's base record reads its
+	// parent's files, so the replica holds its history that far with no file
+	// of its own. Must be set before calling Open().
+	BaseTXID ltx.TXID
 
 	// Remote replica for the database.
 	// Must be set before calling Open().
@@ -1902,7 +1909,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 	if db.Replica.AutoRecoverEnabled {
 		db.setSyncDiagPhase(diagPhaseInitUploadFiles)
-		if err := db.verifyUploadFiles(replicaInfo.MaxTXID); db.recoversFrom(err) {
+		if err := db.verifyUploadFiles(max(replicaInfo.MaxTXID, db.BaseTXID)); db.recoversFrom(err) {
 			if dbPos, err = db.discardUploadFiles(err); err != nil {
 				return err
 			}
@@ -2803,6 +2810,8 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *o
 			continue
 		}
 
+		db.move()
+
 		// Check if the caller has canceled during processing.
 		select {
 		case <-ctx.Done():
@@ -2871,6 +2880,7 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
+		db.move()
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)

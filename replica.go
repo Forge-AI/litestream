@@ -262,7 +262,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	defer func() { _ = f.Close() }()
 
 	started := time.Now()
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, movingFile{f: f, db: r.db})
 	if err != nil {
 		if _, pending := r.db.pendingFullSnapshots.Load(maxTXID); level == 0 && pending {
 			r.Logger().Warn("full snapshot upload failed", "txid", uint64(maxTXID), "elapsed_ms", time.Since(started).Milliseconds(), "error", err.Error())
@@ -362,7 +362,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 			return pos, fmt.Errorf("max restorable ltx file: %w", err)
 		}
 	}
-	return ltx.Pos{TXID: info.MaxTXID}, nil
+	return ltx.Pos{TXID: max(info.MaxTXID, r.db.BaseTXID)}, nil
 }
 
 func (r *Replica) maxRestorableLTXFileInfo(ctx context.Context) (ltx.FileInfo, error) {
