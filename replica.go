@@ -353,7 +353,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 			return pos, fmt.Errorf("max restorable ltx file: %w", err)
 		}
 	}
-	return ltx.Pos{TXID: info.MaxTXID}, nil
+	return ltx.Pos{TXID: max(info.MaxTXID, r.db.BaseTXID)}, nil
 }
 
 func (r *Replica) maxRestorableLTXFileInfo(ctx context.Context) (ltx.FileInfo, error) {

@@ -791,6 +791,76 @@ func (s *unsignedRangeSigner) SignHTTP(ctx context.Context, credentials aws.Cred
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
 // Objects smaller than the part size are written with a single PutObject call
 // to avoid the multipart upload manager's 5 MiB part buffers (issue #1327).
+// WriteHead writes one small object at a full key.
+func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(c.Bucket),
+		Key:           aws.String(key),
+		Body:          bytes.NewReader(text),
+		ContentLength: aws.Int64(int64(len(text))),
+	})
+	if err != nil {
+		return fmt.Errorf("s3: put head %s: %w", key, err)
+	}
+	return nil
+}
+
+// ReadHead reads one small object at a full key.
+func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
+	if isNotExists(err) {
+		return nil, os.ErrNotExist
+	} else if err != nil {
+		return nil, fmt.Errorf("s3: get head %s: %w", key, err)
+	}
+	defer func() { _ = out.Body.Close() }()
+	return io.ReadAll(out.Body)
+}
+
+// ObjectKey returns the full key of a small object of this replica.
+func (c *ReplicaClient) ObjectKey(name string) string {
+	return c.Path + "/" + name
+}
+
+// ListHeads lists the full keys of the small objects under dir.
+func (c *ReplicaClient) ListHeads(ctx context.Context, dir string) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	var keys []string
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(dir + "/"),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list heads %s: %w", dir, err)
+		}
+		for _, obj := range page.Contents {
+			keys = append(keys, aws.ToString(obj.Key))
+		}
+	}
+	return keys, nil
+}
+
+// DeleteHead deletes one small object at a full key.
+func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)}); err != nil {
+		return fmt.Errorf("s3: delete head %s: %w", key, err)
+	}
+	return nil
+}
+
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
