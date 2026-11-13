@@ -284,6 +284,10 @@ type Config struct {
 	// When enabled, logs warnings if gaps or overlaps are detected.
 	VerifyCompaction bool `yaml:"verify-compaction"`
 
+	// Unix socket that faults a lazy copy's absent segments in before
+	// Litestream reads the database file raw.
+	FaultSocket string `yaml:"fault-socket"`
+
 	// Retention configuration
 	Retention RetentionConfig `yaml:"retention"`
 
