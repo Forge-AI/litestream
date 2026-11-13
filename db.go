@@ -172,6 +172,11 @@ type DB struct {
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
 
+	// BaseTXID is the TXID through which the database's base record reads its
+	// parent's files, so the replica holds its history that far with no file
+	// of its own. Must be set before calling Open().
+	BaseTXID ltx.TXID
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -999,6 +1004,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.VerifyCompaction = db.VerifyCompaction
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
+	db.compactor.forgetHolds()
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
@@ -3580,7 +3586,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	// Remove files marked for deletion from remote storage (unless retention disabled).
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -3716,7 +3722,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
