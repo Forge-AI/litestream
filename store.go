@@ -527,7 +527,7 @@ type SyncDBResult struct {
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
 // Lock waits are context-aware: the timeout is honored while waiting for
 // the database sync executor and the replica sync lock.
-func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) (SyncDBResult, error) {
+func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) (_ SyncDBResult, err error) {
 	db := s.FindDB(path)
 	if db == nil {
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
@@ -536,14 +536,7 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 	var phase atomic.Value
 	phase.Store("is_open")
 	var deadline sync.Once
-	warnDeadline := func() {
-		msg := "database sync deadline exceeded"
-		switch cause := context.Cause(ctx); {
-		case errors.Is(cause, ErrStalled):
-			msg = "database sync moved no bytes for its stall window"
-		case !errors.Is(cause, context.DeadlineExceeded):
-			return
-		}
+	warn := func(msg string) {
 		deadline.Do(func() {
 			holder := db.SyncDiagnostic()
 			db.Logger.Warn(msg,
@@ -564,10 +557,18 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 				"wait_seconds", holder.ExecutorWaitSeconds)
 		})
 	}
+	warnDeadline := func() {
+		if errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+			warn("database sync deadline exceeded")
+		}
+	}
 	stop := context.AfterFunc(ctx, warnDeadline)
 	defer func() {
 		stop()
 		warnDeadline()
+		if err != nil && errors.Is(context.Cause(ctx), ErrStalled) {
+			warn("database sync moved no bytes for its stall window")
+		}
 	}()
 
 	if !db.IsOpen() {
