@@ -69,7 +69,8 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 		t.Fatalf("a child at its base's TXID %s must continue: %+v", base, proof)
 	}
 	store := litestream.NewStore(nil, nil)
-	if _, err := store.CompactDB(ctx, child, store.SnapshotLevel()); !errors.Is(err, litestream.ErrNoCompaction) {
+	due := &litestream.CompactionLevel{Level: litestream.SnapshotLevel, Interval: time.Nanosecond}
+	if _, err := store.CompactDB(ctx, child, due); !errors.Is(err, litestream.ErrNoCompaction) {
 		t.Fatalf("a child at its base's TXID %s holds its snapshot through the base, so it must snapshot nothing: %v", base, err)
 	}
 	childSQL := openServerSQLDB(t, ctx, childPath)
@@ -80,6 +81,9 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 	}
 	if err := child.Replica.Sync(ctx); err != nil {
 		t.Fatal(err)
+	}
+	if _, err := store.CompactDB(ctx, child, store.SnapshotLevel()); !errors.Is(err, litestream.ErrCompactionTooEarly) {
+		t.Fatalf("a child past its base takes its first snapshot one snapshot interval after it opened on that base, as if the base were its snapshot: %v", err)
 	}
 
 	itr, err := client.LTXFiles(ctx, 0, 0, false)
