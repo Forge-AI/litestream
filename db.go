@@ -71,6 +71,7 @@ type DB struct {
 	notify    chan struct{} // closes on WAL change
 	chkMu     sync.RWMutex  // checkpoint lock
 	opened    bool          // true if Open() was called and Close() not yet called
+	openedAt  time.Time
 	syncState syncState
 	syncDiag  diagState
 	moved     atomic.Int64
@@ -1012,6 +1013,7 @@ func (db *DB) Open() (err error) {
 	// Mark as opened only after successful initialization.
 	db.mu.Lock()
 	db.opened = true
+	db.openedAt = time.Now()
 	db.mu.Unlock()
 
 	return nil
