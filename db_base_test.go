@@ -2,6 +2,7 @@ package litestream_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -66,6 +67,10 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 	}
 	if !proof.Continued || proof.TXID != uint64(base) {
 		t.Fatalf("a child at its base's TXID %s must continue: %+v", base, proof)
+	}
+	store := litestream.NewStore(nil, nil)
+	if _, err := store.CompactDB(ctx, child, store.SnapshotLevel()); !errors.Is(err, litestream.ErrNoCompaction) {
+		t.Fatalf("a child at its base's TXID %s holds its snapshot through the base, so it must snapshot nothing: %v", base, err)
 	}
 	childSQL := openServerSQLDB(t, ctx, childPath)
 	t.Cleanup(func() { _ = childSQL.Close() })
