@@ -22,7 +22,7 @@ import (
 	"github.com/superfly/ltx"
 )
 
-func TestDB_AWriterDuringACheckpointOfALargeDatabaseWaitsUnderItsBusyTimeout(t *testing.T) {
+func TestDB_ACheckpointOfALargeWALCopiesNothingWhileItHoldsTheWriteLock(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	setup, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -52,9 +52,8 @@ func TestDB_AWriterDuringACheckpointOfALargeDatabaseWaitsUnderItsBusyTimeout(t *
 		t.Fatal(err)
 	}
 
-	const busyTimeout = 5 * time.Second
 	const formerTruncatePageN = 121359
-	writer := openConn(t, db, busyTimeout)
+	writer := openConn(t, db, 0)
 	if _, err := writer.Exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) INSERT INTO t SELECT i, randomblob(400) FROM n`, formerTruncatePageN); err != nil {
 		t.Fatal(err)
 	}
@@ -66,31 +65,36 @@ func TestDB_AWriterDuringACheckpointOfALargeDatabaseWaitsUnderItsBusyTimeout(t *
 		t.Fatalf("the wal holds %d frames, want more than %d", frames, formerTruncatePageN)
 	}
 
-	var waited time.Duration
-	committed := make(chan error, 1)
+	barrier, released := false, false
+	var written []string
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if barrier {
+			written = append(written, filepath.Base(name))
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
 	db.checkpointBarrierTaken = func() {
-		go func() {
-			started := time.Now()
-			_, err := writer.Exec(`INSERT INTO t (id) VALUES (0)`)
-			waited = time.Since(started)
-			committed <- err
-		}()
+		barrier = true
+		if _, err := writer.Exec(`INSERT INTO t (id) VALUES (0)`); !isSQLiteBusyError(err) {
+			t.Errorf("a write once the barrier is taken: %v, want SQLITE_BUSY", err)
+		}
+	}
+	db.checkpointBarrierReleased = func() {
+		barrier, released = false, true
+		if _, err := writer.Exec(`INSERT INTO t (id) VALUES (0)`); err != nil {
+			t.Errorf("a write once the barrier is released failed: %v", err)
+		}
 	}
 	err = db.Sync(t.Context())
-	db.checkpointBarrierTaken = nil
+	db.openLTXFile, db.checkpointBarrierTaken, db.checkpointBarrierReleased = defaultOpenLTXFile, nil, nil
 	if err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-committed:
-		if err != nil {
-			t.Fatalf("a write queued behind the checkpoint barrier failed after %s: %v", waited, err)
-		}
-	case <-time.After(2 * busyTimeout):
-		t.Fatal("the sync took no checkpoint, so no write queued behind it")
+	if !released {
+		t.Fatal("the sync took no checkpoint")
 	}
-	if waited >= busyTimeout {
-		t.Fatalf("a write queued behind the checkpoint barrier waited %s, want under its %s busy_timeout", waited, busyTimeout)
+	if len(written) != 0 {
+		t.Fatalf("the barrier held the write lock while it wrote %q, want only the PASSIVE fold under it", written)
 	}
 
 	for _, mode := range []string{"TRUNCATE", "RESTART"} {
