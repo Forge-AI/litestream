@@ -861,7 +861,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		if err != nil {
 			return nil, fmt.Errorf("fetch db position: %w", err)
 		}
-		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
+		if head := max(dstInfo.MaxTXID, db.BaseTXID); head != 0 && head >= pos.TXID {
 			return nil, ErrNoCompaction
 		}
 
