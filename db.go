@@ -75,6 +75,7 @@ type DB struct {
 	abandoned                 context.Context
 	abandon                   context.CancelFunc
 	opened                    bool // true if Open() was called and Close() not yet called
+	openedAt                  time.Time
 	syncState                 syncState
 	syncDiag                  diagState
 	handover                  handoverClaim
@@ -1015,6 +1016,7 @@ func (db *DB) Open() (err error) {
 	// Mark as opened only after successful initialization.
 	db.mu.Lock()
 	db.opened = true
+	db.openedAt = time.Now()
 	db.mu.Unlock()
 
 	return nil

@@ -851,7 +851,11 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	dstInfo, err := db.MaxLTXFileInfo(ctx, dstLevel)
 	if err != nil {
 		return nil, fmt.Errorf("fetch dst level info: %w", err)
-	} else if dstInfo.CreatedAt.After(prevCompactionAt) {
+	}
+	if dstLevel == SnapshotLevel && dstInfo.MaxTXID < db.BaseTXID {
+		dstInfo = ltx.FileInfo{Level: SnapshotLevel, MinTXID: 1, MaxTXID: db.BaseTXID, CreatedAt: db.openedAt}
+	}
+	if dstInfo.CreatedAt.After(prevCompactionAt) {
 		return nil, ErrCompactionTooEarly
 	}
 
