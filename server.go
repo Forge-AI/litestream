@@ -84,6 +84,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /register", s.handleRegister)
 	mux.HandleFunc("POST /unregister", s.handleUnregister)
 	mux.HandleFunc("POST /sync", s.handleSync)
+	mux.HandleFunc("POST /hold", s.handleHold)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 	mux.HandleFunc("GET /debug/sync-status", s.handleSyncStatus)
@@ -219,6 +220,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		status = "already_running"
 	} else {
 		db.SetHandover(ltx.TXID(req.HandoverTXID))
+		db.BaseTXID = ltx.TXID(req.BaseTXID)
 		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
 			db.SetHandover(0)
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
@@ -393,6 +395,7 @@ type StartRequest struct {
 	Path         string `json:"path"`
 	Timeout      int    `json:"timeout,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
+	BaseTXID     uint64 `json:"base_txid,omitempty"`
 }
 
 // StartResponse is the response body for the /start endpoint.
@@ -518,6 +521,58 @@ type SyncResponse struct {
 	ReplicatedTXID uint64 `json:"replicated_txid"`
 }
 
+func (s *Server) handleHold(w http.ResponseWriter, r *http.Request) {
+	var req HoldRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+	if req.Path == "" || req.Name == "" || req.ChildBase == "" {
+		writeJSONError(w, http.StatusBadRequest, "path, name and child_base required", nil)
+		return
+	}
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusNotFound, "database not found", nil)
+		return
+	}
+	if !db.IsOpen() {
+		writeJSONError(w, http.StatusConflict, fmt.Sprintf("%s: %s", ErrDatabaseNotOpen, expandedPath), nil)
+		return
+	}
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	defer context.AfterFunc(s.ctx, cancel)()
+	switch err := db.compactor.Hold(ctx, req.Name, req.Hold); {
+	case err == nil:
+		writeJSON(w, http.StatusOK, HoldResponse{Status: "held", Path: expandedPath, Name: req.Name})
+	case errors.Is(err, ErrHeldFileGone):
+		writeJSONError(w, http.StatusGone, err.Error(), nil)
+	default:
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+	}
+}
+
+// HoldRequest is the request body for the /hold endpoint: it keeps the files
+// a child database's base record reads from this database's replica.
+type HoldRequest struct {
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Hold
+}
+
+// HoldResponse is the response body for the /hold endpoint.
+type HoldResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+}
+
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
 	dbs := s.store.DBs()
 	resp := ListResponse{
@@ -593,6 +648,7 @@ type RegisterDatabaseRequest struct {
 	Path                 string `json:"path"`
 	ReplicaURL           string `json:"replica_url"`
 	HandoverTXID         uint64 `json:"handover_txid,omitempty"`
+	BaseTXID             uint64 `json:"base_txid,omitempty"`
 	CheckpointIntervalMS int64  `json:"checkpoint_interval_ms,omitempty"`
 }
 
@@ -657,6 +713,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create new database.
 	db := NewDB(expandedPath)
+	db.BaseTXID = ltx.TXID(req.BaseTXID)
 	if req.HandoverTXID != 0 {
 		db.SetHandover(ltx.TXID(req.HandoverTXID))
 	}
