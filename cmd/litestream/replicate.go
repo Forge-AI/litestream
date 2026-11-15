@@ -359,6 +359,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.VerifyCompaction {
 		c.Store.SetVerifyCompaction(true)
 	}
+	if c.Config.FaultSocket != "" {
+		c.Store.SetFaultSocket(c.Config.FaultSocket)
+	}
 	if c.Config.Retention.Enabled != nil && !*c.Config.Retention.Enabled {
 		c.Store.SetRetentionEnabled(false)
 	}
