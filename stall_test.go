@@ -72,6 +72,26 @@ func TestStore_SyncEndsOnceItsUploadStopsMoving(t *testing.T) {
 	}
 }
 
+func TestStore_SyncWarnsOfAStallOnlyWhenTheStallEndsIt(t *testing.T) {
+	db := openReplicatedDB(t)
+	writeRows(t, db, 1)
+	logs := &stallLog{}
+	db.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	ctx, cancel := db.untilStalled(t.Context(), testStall)
+	defer cancel()
+	db.pay = func(context.Context) { <-ctx.Done() }
+
+	if _, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if cause := context.Cause(ctx); !errors.Is(cause, ErrStalled) {
+		t.Fatalf("cause = %v, want the stall window to pass while the sync paid its compaction", cause)
+	}
+	if got := logs.stalls.Load(); got != 0 {
+		t.Fatalf("stall warnings = %d, want 0", got)
+	}
+}
+
 func writeRows(t *testing.T, db *DB, rows int) {
 	t.Helper()
 	sqldb, err := sql.Open("sqlite", db.Path())
