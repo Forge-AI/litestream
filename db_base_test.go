@@ -37,7 +37,7 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	testingutil.MustCloseSQLDB(t, sqldb)
-	headMin, base, err := parent.MaxLTX()
+	_, base, err := parent.MaxLTX()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,10 +45,6 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 	childPath := filepath.Join(dir, "child")
 	copyFile(t, parentPath, childPath)
 	child := testingutil.NewDB(t, childPath)
-	if err := os.MkdirAll(child.LTXLevelDir(0), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	copyFile(t, parent.LTXPath(0, headMin, base), child.LTXPath(0, headMin, base))
 	client := file.NewReplicaClient(filepath.Join(dir, "child-replica"))
 	child.MonitorInterval = 0
 	child.ShutdownSyncTimeout = 0
@@ -60,6 +56,9 @@ func TestDB_BaseTXIDContinuesAChildWhoseReplicaHoldsNoFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = child.Close(context.Background()) })
+	if _, last, err := child.MaxLTX(); err != nil || last != base {
+		t.Fatalf("a child holding no file reports its base %s as its last TXID, so a park records its landing there: %s, %v", base, last, err)
+	}
 
 	proof, err := child.ProveHandover(ctx)
 	if err != nil {
