@@ -2,9 +2,8 @@ package main_test
 
 import (
 	"context"
-	"fmt"
 	"os"
-	"sync/atomic"
+	"path/filepath"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -12,14 +11,14 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-var testSocketCounter uint64
-
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	n := atomic.AddUint64(&testSocketCounter, 1)
-	path := fmt.Sprintf("/tmp/ls-cmd-test-%d.sock", n)
-	t.Cleanup(func() { os.Remove(path) })
-	return path
+	dir, err := os.MkdirTemp("/tmp", "ls-cmd-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "control.sock")
 }
 
 func TestInfoCommand_Run(t *testing.T) {
