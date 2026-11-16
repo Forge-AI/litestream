@@ -127,7 +127,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -188,7 +188,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -247,7 +247,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -308,7 +308,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -369,7 +369,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -440,7 +440,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -499,7 +499,7 @@ jobs:
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
