@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync/atomic"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,14 +18,14 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-var testSocketCounter uint64
-
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	n := atomic.AddUint64(&testSocketCounter, 1)
-	path := fmt.Sprintf("/tmp/ls-test-%d.sock", n)
-	t.Cleanup(func() { os.Remove(path) })
-	return path
+	dir, err := os.MkdirTemp("/tmp", "ls-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "control.sock")
 }
 
 func TestServer_HandleInfo(t *testing.T) {
