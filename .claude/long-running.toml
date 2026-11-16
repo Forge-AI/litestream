@@ -1,2 +1,2 @@
 [landing]
-bases = ["ssql-litestream-legacy"]
+bases = ["ssql-litestream-legacy", "sandsql-listen-fd-legacy"]
