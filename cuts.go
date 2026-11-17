@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/superfly/ltx"
 
@@ -36,6 +38,7 @@ type missedCut struct {
 type pendingCut struct {
 	name string
 	at   walPosition
+	atMS int64
 }
 
 type walSpan struct {
@@ -48,15 +51,15 @@ func (db *DB) cutsPath() string {
 	return filepath.Join(db.metaPath, "cuts")
 }
 
-func (db *DB) pendingCuts() ([]pendingCut, error) {
+func (db *DB) pendingCuts(start walPosition) ([]pendingCut, error) {
+	cuts := db.secondCuts(start)
 	dir := db.cutsPath()
 	ents, err := os.ReadDir(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return cuts, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("list cuts: %w", err)
 	}
-	var cuts []pendingCut
 	for _, ent := range ents {
 		if strings.HasSuffix(ent.Name(), ".tmp") {
 			continue
@@ -81,6 +84,9 @@ func (db *DB) pendingCuts() ([]pendingCut, error) {
 func (db *DB) settleCuts(span walSpan, info syncInfo, prior ltx.Pos, file *ltx.Pos) error {
 	var settled bool
 	for _, cut := range span.cuts {
+		if cut.name == "" {
+			continue
+		}
 		verdict, err := db.cutVerdict(cut.at, span, info, prior, file)
 		if err != nil {
 			return err
@@ -190,4 +196,106 @@ func (db *DB) writeCut(name string, verdict any) error {
 		return fmt.Errorf("rename cut %s: %w", name, err)
 	}
 	return nil
+}
+
+// Cut names where the last write of one second ends: the WAL holds Frames
+// frames under Salt once that write commits, and AtMS is the write's time, as
+// the server writing the database recorded it. A database sent a cut ends each
+// LTX file at one from then on, so no file holds the writes of two seconds and
+// each file's timestamp falls in the second of its last write.
+type Cut struct {
+	Salt   uint64 `json:"salt"`
+	Frames uint32 `json:"frames"`
+	AtMS   int64  `json:"at_ms"`
+}
+
+type cuts struct {
+	sync.Mutex
+	on       bool
+	pending  []Cut
+	baseMS   int64
+	stampMS  int64
+	flushing int
+}
+
+// AddCuts queues cuts for the syncs that follow.
+func (db *DB) AddCuts(add []Cut) {
+	if len(add) == 0 {
+		return
+	}
+	db.cuts.Lock()
+	defer db.cuts.Unlock()
+	db.cuts.on = true
+	db.cuts.pending = append(db.cuts.pending, add...)
+}
+
+func (db *DB) secondCuts(start walPosition) []pendingCut {
+	db.cuts.Lock()
+	defer db.cuts.Unlock()
+	db.passCuts(start)
+	cuts := make([]pendingCut, 0, len(db.cuts.pending))
+	for _, cut := range db.cuts.pending {
+		cuts = append(cuts, pendingCut{at: db.cutPosition(cut), atMS: cut.AtMS})
+	}
+	return cuts
+}
+
+func (db *DB) stampSpan(span walSpan, snapshotting bool, now time.Time) (time.Time, bool) {
+	db.cuts.Lock()
+	defer db.cuts.Unlock()
+	if !db.cuts.on {
+		return now, true
+	}
+	at := now.UnixMilli()
+	if snapshotting {
+		return time.UnixMilli(max(at, db.cuts.stampMS)), true
+	}
+	var next, forked bool
+	var nearest int64
+	for _, cut := range span.cuts {
+		switch {
+		case cut.atMS == 0:
+			forked = forked || cut.at == span.end
+		case cut.at.sameWAL(span.end) && cut.at.Offset >= span.end.Offset && (!next || cut.at.Offset < nearest):
+			next, nearest, at = true, cut.at.Offset, cut.atMS
+		}
+	}
+	if !next && !forked && db.cuts.flushing == 0 && db.cuts.baseMS/1000 != at/1000 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(max(at, db.cuts.stampMS)), true
+}
+
+func (db *DB) cutWritten(end walPosition, at time.Time) {
+	db.cuts.Lock()
+	defer db.cuts.Unlock()
+	db.cuts.stampMS = max(db.cuts.stampMS, at.UnixMilli())
+	db.passCuts(end)
+}
+
+func (db *DB) passCuts(through walPosition) {
+	passed := -1
+	for i, cut := range db.cuts.pending {
+		if at := db.cutPosition(cut); at.sameWAL(through) && at.Offset <= through.Offset {
+			passed = i
+			db.cuts.baseMS = max(db.cuts.baseMS, cut.AtMS)
+		}
+	}
+	db.cuts.pending = db.cuts.pending[passed+1:]
+}
+
+func (db *DB) cutPosition(cut Cut) walPosition {
+	frameSize := int64(WALFrameHeaderSize + db.pageSize)
+	return walPosition{Salt1: uint32(cut.Salt >> 32), Salt2: uint32(cut.Salt), Offset: WALHeaderSize + int64(cut.Frames)*frameSize}
+}
+
+func (db *DB) flushCuts() func() {
+	db.cuts.Lock()
+	db.cuts.flushing++
+	db.cuts.Unlock()
+	return func() {
+		db.cuts.Lock()
+		db.cuts.flushing--
+		db.cuts.Unlock()
+	}
 }

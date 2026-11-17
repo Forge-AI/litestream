@@ -470,6 +470,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
+	if db := s.store.FindDB(expandedPath); db != nil {
+		db.AddCuts(req.Cuts)
+		defer db.flushCuts()()
+	}
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
 		var waitErr *ExecutorWaitError
@@ -511,6 +515,7 @@ type SyncRequest struct {
 	Wait       bool   `json:"wait,omitempty"`
 	Checkpoint bool   `json:"checkpoint,omitempty"`
 	Timeout    int    `json:"timeout,omitempty"`
+	Cuts       []Cut  `json:"cuts,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.

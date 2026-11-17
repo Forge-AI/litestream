@@ -79,6 +79,7 @@ type DB struct {
 	syncState                 syncState
 	syncDiag                  diagState
 	handover                  handoverClaim
+	cuts                      cuts
 
 	lastLTXPage *verifiedLTXPage
 
@@ -1043,6 +1044,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
+		defer db.flushCuts()()
 		if _, e := db.syncLocked(ctx, 0); e != nil {
 			err = e
 		}
@@ -2493,6 +2495,7 @@ type syncResult struct {
 	newWALSize     int64
 	synced         bool
 	limited        bool
+	cutShort       bool
 	syncedToWALEnd bool
 	pos            *ltx.Pos
 	l0FileInfo     *ltx.FileInfo
@@ -2720,7 +2723,7 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 	if maxOffset > 0 {
 		span.end.Offset = maxOffset
 	}
-	if span.cuts, err = db.pendingCuts(); err != nil {
+	if span.cuts, err = db.pendingCuts(span.start); err != nil {
 		return result, span, err
 	}
 	land := span.end.Offset
@@ -2767,6 +2770,14 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 		return result, span, nil
 	}
 
+	timestamp, stamped := db.stampSpan(span, info.snapshotting, time.Now())
+	if !stamped {
+		db.Logger.Log(ctx, internal.LevelTrace, "sync: skip", "reason", "the wal's last writes wait for their second's cut")
+		span.end, span.next = span.start, nil
+		result.limited, result.cutShort = true, true
+		return result, span, nil
+	}
+
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
 		if isDiskFullError(err) {
@@ -2796,7 +2807,6 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 		"salt1", rd.salt1,
 		"salt2", rd.salt2)
 
-	timestamp := time.Now()
 	enc, err := ltx.NewEncoder(ltxFile)
 	if err != nil {
 		return result, span, fmt.Errorf("new ltx encoder: %w", err)
@@ -2924,6 +2934,7 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 	if pageEncoder.page.data != nil {
 		db.lastLTXPage = &pageEncoder.page
 	}
+	db.cutWritten(span.end, timestamp)
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
@@ -3205,6 +3216,10 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, exec *syncExecutor) (e
 		return fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
+	if result.cutShort {
+		db.Logger.Debug("passive checkpoint skipped, the wal's last writes wait for their second's cut")
+		return nil
+	}
 
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
