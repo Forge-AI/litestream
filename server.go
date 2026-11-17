@@ -473,6 +473,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
+	if db := s.store.FindDB(expandedPath); db != nil {
+		db.AddCuts(req.Cuts)
+		defer db.flushCuts()()
+	}
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
 		switch {
@@ -517,7 +521,8 @@ type SyncRequest struct {
 	Timeout    int    `json:"timeout,omitempty"`
 	// Stall, in seconds, ends the sync only once it moves no bytes for that
 	// long, in place of Timeout.
-	Stall int `json:"stall,omitempty"`
+	Stall int   `json:"stall,omitempty"`
+	Cuts  []Cut `json:"cuts,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.
