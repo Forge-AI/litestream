@@ -243,8 +243,8 @@ type pageMapState struct {
 	retired  bool
 }
 
-func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo, local *os.File, always bool) error {
-	client, ok := db.Replica.Client.(PageMapClient)
+func (db *DB) writePageMap(ctx context.Context, replica ReplicaClient, upload *ltx.FileInfo, local *os.File, always bool) error {
+	client, ok := replica.(PageMapClient)
 	if !ok {
 		return nil
 	}
@@ -269,7 +269,7 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo, local *os.
 	defer func() { _ = last.f.Close() }()
 	if plan == nil {
 		for level := 0; level <= SnapshotLevel; level++ {
-			itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
+			itr, err := replica.LTXFiles(ctx, level, 0, false)
 			if err != nil {
 				return fmt.Errorf("list level %d for the page map at %s: %w", level, txID, err)
 			}
@@ -292,7 +292,7 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo, local *os.
 			return fmt.Errorf("read the header of the uploaded file: %w", err)
 		}
 	case last.f == nil || newest.MaxTXID != last.txID:
-		if hdr, err = FetchLTXHeader(ctx, db.Replica.Client, newest); err != nil {
+		if hdr, err = FetchLTXHeader(ctx, replica, newest); err != nil {
 			return fmt.Errorf("read the header of the page map's last file: %w", err)
 		}
 	}
@@ -314,7 +314,7 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo, local *os.
 		if local != nil && samePageMapFile(info, upload) {
 			err = scanLocalPageIndex(local, info.Size, runs.add)
 		} else {
-			err = scanPageIndex(ctx, db.Replica.Client, info, runs.add)
+			err = scanPageIndex(ctx, replica, info, runs.add)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("read the page index of %s: %w", ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
