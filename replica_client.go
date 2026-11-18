@@ -103,8 +103,10 @@ func scanPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInfo
 		return err
 	}
 	defer rc.Close()
+	return readPageIndex(bufio.NewReader(rc), fn)
+}
 
-	r := bufio.NewReader(rc)
+func readPageIndex(r io.ByteReader, fn func(pgno uint32, offset, size int64) error) error {
 	var last uint64
 	for {
 		pgno, err := binary.ReadUvarint(r)

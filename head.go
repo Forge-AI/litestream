@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"sync"
@@ -23,7 +22,6 @@ const (
 
 type HeadClient interface {
 	WriteHead(ctx context.Context, key string, text []byte) error
-	WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error
 	ReadHead(ctx context.Context, key string) ([]byte, error)
 }
 

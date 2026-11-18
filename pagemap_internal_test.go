@@ -58,11 +58,11 @@ func TestPageMap_WritesTheSpecExampleByteForByte(t *testing.T) {
 		t.Fatalf("encoded %d bytes, reported %d:\n%s\nwant 170:\n%s", len(b), size, got, pageMapExample)
 	}
 
-	txID, sections, err := readPageMap(f, size)
+	last, err := readPageMap(f, size)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if txID != 9 || len(sections) != 2 || sections[0].at != 98 || sections[0].records != 2 || sections[1].at != 130 || sections[1].records != 2 || *sections[1].info != *plan[1] {
-		t.Fatalf("read the example's table as txid %s over %+v, want txid 9 with two sections of two runs at 98 and 130", txID, sections)
+	if sections := last.sections; last.txID != 9 || last.pageSize != 4096 || last.commit != 600 || len(sections) != 2 || sections[0].at != 98 || sections[0].records != 2 || sections[1].at != 130 || sections[1].records != 2 || *sections[1].info != *plan[1] {
+		t.Fatalf("read the example as txid %s, %d-byte pages and %d pages over %+v, want txid 9, 4096-byte pages and 600 pages with two sections of two runs at 98 and 130", last.txID, last.pageSize, last.commit, sections)
 	}
 }
