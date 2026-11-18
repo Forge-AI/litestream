@@ -769,6 +769,23 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return nil
 }
 
+// WriteHeadFrom writes one small object at a full key from r.
+func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:        aws.String(c.Bucket),
+		Key:           aws.String(key),
+		Body:          r,
+		ContentLength: aws.Int64(r.Size()),
+	})
+	if err != nil {
+		return fmt.Errorf("s3: put head %s: %w", key, err)
+	}
+	return nil
+}
+
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
 	if err := c.Init(ctx); err != nil {
@@ -782,10 +799,6 @@ func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error
 	}
 	defer func() { _ = out.Body.Close() }()
 	return io.ReadAll(out.Body)
-}
-
-func (c *ReplicaClient) PageMapKey() string {
-	return c.Path + "/" + litestream.PageMapName
 }
 
 // ObjectKey returns the full key of a small object of this replica.

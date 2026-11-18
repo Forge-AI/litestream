@@ -18,6 +18,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -239,6 +240,15 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return err
 }
 
+// WriteHeadFrom writes one small object at a full key from r in one request.
+func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	_, err := c.client.ServiceClient().NewContainerClient(c.Bucket).NewBlockBlobClient(key).Upload(ctx, streaming.NopCloser(r), nil)
+	return err
+}
+
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
 	if err := c.Init(ctx); err != nil {
@@ -252,10 +262,6 @@ func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return io.ReadAll(resp.Body)
-}
-
-func (c *ReplicaClient) PageMapKey() string {
-	return path.Join(c.Path, litestream.PageMapName)
 }
 
 // ObjectKey returns the full key of a small object of this replica.

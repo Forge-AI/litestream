@@ -1,182 +1,191 @@
 package litestream
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc64"
+	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 const (
-	PageMapName        = "map.pmap"
-	PageMapMagic       = "PMAP"
-	PageMapVersion     = 1
+	PageMapName        = "map.runs"
+	PageMapMagic       = "RUNS"
+	PageMapVersion     = 2
 	PageMapHeaderSize  = 32
-	PageMapFileSize    = 25
+	PageMapFileSize    = 33
+	PageMapRunSize     = 16
 	PageMapTrailerSize = 8
+
+	pageMapRunPages    = 256
+	pageMapRunMaxSize  = 1<<24 - 1
+	retiredPageMapName = "map.pmap"
 )
 
 type PageMapClient interface {
 	HeadClient
-	PageMapKey() string
-}
-
-type PageMap struct {
-	TXID     ltx.TXID
-	PageSize uint32
-	Files    []*ltx.FileInfo
-	Pages    []PageMapEntry
-}
-
-type PageMapEntry struct {
-	File   uint32
-	Offset int64
-	Size   int64
+	ObjectKey(name string) string
+	DeleteHead(ctx context.Context, key string) error
 }
 
 var pageMapCRC = crc64.MakeTable(crc64.ISO)
 
-func (m *PageMap) Encode() []byte {
-	b := make([]byte, 0, PageMapHeaderSize+len(m.Files)*PageMapFileSize+len(m.Pages)*7+PageMapTrailerSize)
-	b = append(b, PageMapMagic...)
-	b = binary.BigEndian.AppendUint32(b, PageMapVersion)
-	b = binary.BigEndian.AppendUint32(b, m.PageSize)
-	b = binary.BigEndian.AppendUint32(b, uint32(len(m.Pages)))
-	b = binary.BigEndian.AppendUint64(b, uint64(m.TXID))
-	b = binary.BigEndian.AppendUint32(b, uint32(len(m.Files)))
-	b = binary.BigEndian.AppendUint32(b, 0)
-	for _, f := range m.Files {
-		b = append(b, byte(f.Level))
-		b = binary.BigEndian.AppendUint64(b, uint64(f.MinTXID))
-		b = binary.BigEndian.AppendUint64(b, uint64(f.MaxTXID))
-		b = binary.BigEndian.AppendUint64(b, uint64(f.Size))
-	}
-	for _, e := range m.Pages {
-		b = binary.AppendUvarint(b, uint64(e.File))
-		b = binary.AppendUvarint(b, uint64(e.Offset))
-		b = binary.AppendUvarint(b, uint64(e.Size))
-	}
-	return binary.BigEndian.AppendUint64(b, crc64.Checksum(b, pageMapCRC))
+type pageMapRuns struct {
+	w            io.Writer
+	first, pages uint32
+	offset, size int64
+	records      uint64
 }
 
-func DecodePageMap(b []byte) (*PageMap, error) {
-	if len(b) < PageMapHeaderSize+PageMapTrailerSize {
-		return nil, fmt.Errorf("page map of %d bytes is shorter than its header and trailer", len(b))
+func (r *pageMapRuns) add(pgno uint32, offset, size int64) error {
+	if r.pages > 0 && pgno == r.first+r.pages && offset == r.offset+r.size && (pgno-1)/pageMapRunPages == (r.first-1)/pageMapRunPages && r.size+size <= pageMapRunMaxSize {
+		r.pages, r.size = r.pages+1, r.size+size
+		return nil
 	}
-	body := b[:len(b)-PageMapTrailerSize]
-	if binary.BigEndian.Uint64(b[len(body):]) != crc64.Checksum(body, pageMapCRC) {
-		return nil, errors.New("page map checksum mismatch")
+	if err := r.flush(); err != nil {
+		return err
 	}
-	if string(body[:4]) != PageMapMagic {
-		return nil, fmt.Errorf("page map magic %q", body[:4])
-	}
-	if version := binary.BigEndian.Uint32(body[4:]); version != PageMapVersion {
-		return nil, fmt.Errorf("page map version %d", version)
-	}
-	m := &PageMap{
-		PageSize: binary.BigEndian.Uint32(body[8:]),
-		TXID:     ltx.TXID(binary.BigEndian.Uint64(body[16:])),
-		Files:    make([]*ltx.FileInfo, binary.BigEndian.Uint32(body[24:])),
-		Pages:    make([]PageMapEntry, binary.BigEndian.Uint32(body[12:])),
-	}
-	rest := body[PageMapHeaderSize:]
-	if len(rest) < len(m.Files)*PageMapFileSize {
-		return nil, fmt.Errorf("page map file table of %d files is cut short", len(m.Files))
-	}
-	for i := range m.Files {
-		f := rest[i*PageMapFileSize:]
-		m.Files[i] = &ltx.FileInfo{
-			Level:   int(f[0]),
-			MinTXID: ltx.TXID(binary.BigEndian.Uint64(f[1:])),
-			MaxTXID: ltx.TXID(binary.BigEndian.Uint64(f[9:])),
-			Size:    int64(binary.BigEndian.Uint64(f[17:])),
-		}
-	}
-	rest = rest[len(m.Files)*PageMapFileSize:]
-	for i := range m.Pages {
-		var v [3]uint64
-		for j := range v {
-			x, n := binary.Uvarint(rest)
-			if n <= 0 {
-				return nil, fmt.Errorf("page map entry of page %d is cut short", i+1)
-			}
-			v[j], rest = x, rest[n:]
-		}
-		if v[2] > 0 && v[0] >= uint64(len(m.Files)) {
-			return nil, fmt.Errorf("page map entry of page %d names file %d of %d", i+1, v[0], len(m.Files))
-		}
-		m.Pages[i] = PageMapEntry{File: uint32(v[0]), Offset: int64(v[1]), Size: int64(v[2])}
-	}
-	if len(rest) != 0 {
-		return nil, fmt.Errorf("page map has %d bytes past its last page", len(rest))
-	}
-	return m, nil
+	r.first, r.pages, r.offset, r.size = pgno, 1, offset, size
+	return nil
 }
 
-type pageMapFile struct {
-	level    int
-	min, max ltx.TXID
-}
-
-func pageMapFileOf(info *ltx.FileInfo) pageMapFile {
-	return pageMapFile{info.Level, info.MinTXID, info.MaxTXID}
-}
-
-func rebasePageMap(prev *PageMap, plan []*ltx.FileInfo, hdr ltx.Header, index func(*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error)) (*PageMap, error) {
-	at := make(map[pageMapFile]int, len(plan))
-	for i, info := range plan {
-		at[pageMapFileOf(info)] = i
+func (r *pageMapRuns) flush() error {
+	if r.pages == 0 {
+		return nil
 	}
-	next := &PageMap{TXID: plan[len(plan)-1].MaxTXID, PageSize: hdr.PageSize, Files: plan, Pages: make([]PageMapEntry, hdr.Commit)}
-	known := make(map[pageMapFile]bool)
-	dropped := make(map[uint32]bool)
-	if prev != nil {
-		for _, info := range prev.Files {
-			known[pageMapFileOf(info)] = true
-		}
-		for i, e := range prev.Pages[:min(len(prev.Pages), len(next.Pages))] {
-			if e.Size == 0 {
-				continue
-			}
-			file, ok := at[pageMapFileOf(prev.Files[e.File])]
-			if !ok {
-				dropped[uint32(i)+1] = true
-				continue
-			}
-			next.Pages[i] = PageMapEntry{File: uint32(file), Offset: e.Offset, Size: e.Size}
-		}
+	var b [PageMapRunSize]byte
+	binary.LittleEndian.PutUint32(b[0:], r.first)
+	binary.LittleEndian.PutUint32(b[4:], r.pages-1|uint32(r.size)<<8)
+	binary.LittleEndian.PutUint64(b[8:], uint64(r.offset))
+	r.records++
+	_, err := r.w.Write(b[:])
+	return err
+}
+
+func encodePageMap(f *os.File, hdr ltx.Header, plan []*ltx.FileInfo, section func(io.Writer, *ltx.FileInfo) (uint64, error)) (int64, error) {
+	head := make([]byte, 0, PageMapHeaderSize+len(plan)*PageMapFileSize)
+	head = append(head, PageMapMagic...)
+	head = binary.LittleEndian.AppendUint32(head, PageMapVersion)
+	head = binary.LittleEndian.AppendUint32(head, hdr.PageSize)
+	head = binary.LittleEndian.AppendUint32(head, hdr.Commit)
+	head = binary.LittleEndian.AppendUint64(head, uint64(plan[len(plan)-1].MaxTXID))
+	head = binary.LittleEndian.AppendUint32(head, uint32(len(plan)))
+	head = binary.LittleEndian.AppendUint32(head, 0)
+	for _, info := range plan {
+		head = append(head, byte(info.Level))
+		head = binary.LittleEndian.AppendUint64(head, uint64(info.MinTXID))
+		head = binary.LittleEndian.AppendUint64(head, uint64(info.MaxTXID))
+		head = binary.LittleEndian.AppendUint64(head, uint64(info.Size))
+		head = binary.LittleEndian.AppendUint64(head, 0)
+	}
+	w := bufio.NewWriter(f)
+	if _, err := w.Write(head); err != nil {
+		return 0, err
 	}
 	for i, info := range plan {
-		if known[pageMapFileOf(info)] {
-			continue
-		}
-		elems, err := index(info)
+		records, err := section(w, info)
 		if err != nil {
-			return nil, fmt.Errorf("read the page index of %s: %w", ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
+			return 0, err
 		}
-		for pgno, elem := range elems {
-			if pgno > hdr.Commit {
-				continue
-			}
-			e := &next.Pages[pgno-1]
-			if e.Size > 0 && int(e.File) > i {
-				continue
-			}
-			*e = PageMapEntry{File: uint32(i), Offset: elem.Offset, Size: elem.Size}
-			delete(dropped, pgno)
+		binary.LittleEndian.PutUint64(head[PageMapHeaderSize+i*PageMapFileSize+25:], records)
+	}
+	if err := w.Flush(); err != nil {
+		return 0, err
+	}
+	if _, err := f.WriteAt(head, 0); err != nil {
+		return 0, err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, err
+	}
+	crc := crc64.New(pageMapCRC)
+	n, err := io.Copy(crc, f)
+	if err != nil {
+		return 0, err
+	}
+	if _, err := f.Write(binary.LittleEndian.AppendUint64(nil, crc.Sum64())); err != nil {
+		return 0, err
+	}
+	return n + PageMapTrailerSize, nil
+}
+
+type pageMapSection struct {
+	info    *ltx.FileInfo
+	at      int64
+	records uint64
+}
+
+type pageMapLast struct {
+	f        *os.File
+	txID     ltx.TXID
+	sections []pageMapSection
+}
+
+func readPageMap(r io.ReaderAt, size int64) (ltx.TXID, []pageMapSection, error) {
+	if size < PageMapHeaderSize+PageMapTrailerSize {
+		return 0, nil, fmt.Errorf("%d bytes is shorter than a header and a trailer", size)
+	}
+	crc := crc64.New(pageMapCRC)
+	if _, err := io.Copy(crc, io.NewSectionReader(r, 0, size-PageMapTrailerSize)); err != nil {
+		return 0, nil, fmt.Errorf("read the body: %w", err)
+	}
+	trailer := make([]byte, PageMapTrailerSize)
+	if _, err := r.ReadAt(trailer, size-PageMapTrailerSize); err != nil {
+		return 0, nil, fmt.Errorf("read the trailer: %w", err)
+	}
+	if binary.LittleEndian.Uint64(trailer) != crc.Sum64() {
+		return 0, nil, fmt.Errorf("%d bytes fail their checksum", size)
+	}
+	hdr := make([]byte, PageMapHeaderSize)
+	if _, err := r.ReadAt(hdr, 0); err != nil {
+		return 0, nil, fmt.Errorf("read the header: %w", err)
+	}
+	if string(hdr[:4]) != PageMapMagic {
+		return 0, nil, fmt.Errorf("magic %q", hdr[:4])
+	}
+	if version := binary.LittleEndian.Uint32(hdr[4:]); version != PageMapVersion {
+		return 0, nil, fmt.Errorf("version %d", version)
+	}
+	table := make([]byte, int(binary.LittleEndian.Uint32(hdr[24:]))*PageMapFileSize)
+	if _, err := r.ReadAt(table, PageMapHeaderSize); err != nil {
+		return 0, nil, fmt.Errorf("read the file table: %w", err)
+	}
+	sections := make([]pageMapSection, len(table)/PageMapFileSize)
+	at := int64(PageMapHeaderSize + len(table))
+	for i := range sections {
+		e := table[i*PageMapFileSize:]
+		sections[i] = pageMapSection{
+			info: &ltx.FileInfo{
+				Level:   int(e[0]),
+				MinTXID: ltx.TXID(binary.LittleEndian.Uint64(e[1:])),
+				MaxTXID: ltx.TXID(binary.LittleEndian.Uint64(e[9:])),
+				Size:    int64(binary.LittleEndian.Uint64(e[17:])),
+			},
+			at:      at,
+			records: binary.LittleEndian.Uint64(e[25:]),
 		}
+		at += int64(sections[i].records) * PageMapRunSize
 	}
-	if len(dropped) > 0 {
-		return rebasePageMap(nil, plan, hdr, index)
+	if at+PageMapTrailerSize != size {
+		return 0, nil, fmt.Errorf("%d bytes, want %d for its %d files", size, at+PageMapTrailerSize, len(sections))
 	}
-	return next, nil
+	return ltx.TXID(binary.LittleEndian.Uint64(hdr[16:])), sections, nil
+}
+
+func samePageMapFile(a, b *ltx.FileInfo) bool {
+	return a.Level == b.Level && a.MinTXID == b.MinTXID && a.MaxTXID == b.MaxTXID
 }
 
 func planPageMap(known []*ltx.FileInfo, txID ltx.TXID) []*ltx.FileInfo {
@@ -206,10 +215,9 @@ func planPageMap(known []*ltx.FileInfo, txID ltx.TXID) []*ltx.FileInfo {
 }
 
 type pageMapState struct {
-	mu      sync.Mutex
-	loaded  bool
-	current *PageMap
-	known   []*ltx.FileInfo
+	mu       sync.Mutex
+	unmapped bool
+	retired  bool
 }
 
 func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
@@ -220,31 +228,26 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
 	s := &db.pageMap
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.loaded {
-		b, err := client.ReadHead(ctx, client.PageMapKey())
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read the page map: %w", err)
-		}
-		if err == nil {
-			if s.current, err = DecodePageMap(b); err != nil {
-				return fmt.Errorf("decode the page map: %w", err)
-			}
-			s.known = slices.Clone(s.current.Files)
-		}
-		s.loaded = true
+
+	path := filepath.Join(db.MetaPath(), PageMapName)
+	last, err := s.open(ctx, client, path)
+	if err != nil {
+		return err
 	}
-	s.known = append(s.known, upload)
-	txID := upload.MaxTXID
-	if s.current != nil {
-		txID = max(txID, s.current.TXID)
+	defer func() { _ = last.f.Close() }()
+	txID := max(upload.MaxTXID, last.txID)
+	known := make([]*ltx.FileInfo, 0, len(last.sections)+1)
+	for _, sec := range last.sections {
+		if !samePageMapFile(sec.info, upload) {
+			known = append(known, sec.info)
+		}
 	}
 
-	plan := planPageMap(s.known, txID)
-	if plan == nil && s.current == nil && db.BaseTXID > 0 {
+	plan := planPageMap(append(known, upload), txID)
+	if plan == nil && last.f == nil && db.BaseTXID > 0 {
 		return nil
 	}
 	if plan == nil {
-		var err error
 		if plan, err = CalcRestorePlan(ctx, db.Replica.Client, txID, time.Time{}, db.Logger); err != nil {
 			return fmt.Errorf("plan the page map at %s: %w", txID, err)
 		}
@@ -253,15 +256,110 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("read the header of the page map's last file: %w", err)
 	}
-	next, err := rebasePageMap(s.current, plan, hdr, func(info *ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
-		return FetchPageIndex(ctx, db.Replica.Client, info)
+
+	tmp, err := os.Create(path + ".tmp")
+	if err != nil {
+		return fmt.Errorf("create the page map: %w", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	defer func() { _ = tmp.Close() }()
+	size, err := encodePageMap(tmp, hdr, plan, func(w io.Writer, info *ltx.FileInfo) (uint64, error) {
+		if i := slices.IndexFunc(last.sections, func(sec pageMapSection) bool { return samePageMapFile(sec.info, info) && sec.info.Size == info.Size }); i >= 0 && !samePageMapFile(info, upload) {
+			sec := last.sections[i]
+			_, err := io.Copy(w, io.NewSectionReader(last.f, sec.at, int64(sec.records)*PageMapRunSize))
+			return sec.records, err
+		}
+		runs := &pageMapRuns{w: w}
+		if err := scanPageIndex(ctx, db.Replica.Client, info, runs.add); err != nil {
+			return 0, fmt.Errorf("read the page index of %s: %w", ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
+		}
+		if err := runs.flush(); err != nil {
+			return 0, err
+		}
+		return runs.records, nil
 	})
 	if err != nil {
+		return fmt.Errorf("encode the page map at %s: %w", plan[len(plan)-1].MaxTXID, err)
+	}
+	_ = last.f.Close()
+	// TODO: delete this once no map.pmap writer can run.
+	if !s.retired {
+		if err := client.DeleteHead(ctx, client.ObjectKey(retiredPageMapName)); err != nil {
+			return fmt.Errorf("delete the retired page map: %w", err)
+		}
+		s.retired = true
+	}
+	if err := client.WriteHeadFrom(ctx, client.ObjectKey(PageMapName), io.NewSectionReader(tmp, 0, size)); err != nil {
+		return fmt.Errorf("write the page map at %s: %w", plan[len(plan)-1].MaxTXID, err)
+	}
+	if err := keepPageMap(tmp, path); err != nil {
 		return err
 	}
-	if err := client.WriteHead(ctx, client.PageMapKey(), next.Encode()); err != nil {
-		return fmt.Errorf("write the page map at %s: %w", next.TXID, err)
+	s.unmapped = false
+	return nil
+}
+
+func (s *pageMapState) open(ctx context.Context, client PageMapClient, path string) (pageMapLast, error) {
+	f, err := os.Open(path)
+	if err == nil {
+		if last, err := readLocalPageMap(f); err == nil {
+			return last, nil
+		}
+		_ = f.Close()
+		if err := os.Remove(path); err != nil {
+			return pageMapLast{}, fmt.Errorf("remove the invalid local page map: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return pageMapLast{}, fmt.Errorf("open the last page map: %w", err)
 	}
-	s.current, s.known = next, slices.Clone(next.Files)
+	if s.unmapped {
+		return pageMapLast{}, nil
+	}
+	b, err := client.ReadHead(ctx, client.ObjectKey(PageMapName))
+	if errors.Is(err, os.ErrNotExist) {
+		s.unmapped = true
+		return pageMapLast{}, nil
+	} else if err != nil {
+		return pageMapLast{}, fmt.Errorf("read the page map: %w", err)
+	}
+	txID, sections, err := readPageMap(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		return pageMapLast{}, fmt.Errorf("the bucket's page map: %w", err)
+	}
+	tmp, err := os.Create(path + ".tmp")
+	if err != nil {
+		return pageMapLast{}, fmt.Errorf("stage the page map: %w", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	defer func() { _ = tmp.Close() }()
+	if _, err := tmp.Write(b); err != nil {
+		return pageMapLast{}, fmt.Errorf("stage the page map: %w", err)
+	}
+	if err := keepPageMap(tmp, path); err != nil {
+		return pageMapLast{}, err
+	}
+	f, err = os.Open(path)
+	return pageMapLast{f: f, txID: txID, sections: sections}, err
+}
+
+func readLocalPageMap(f *os.File) (pageMapLast, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return pageMapLast{}, err
+	}
+	txID, sections, err := readPageMap(f, fi.Size())
+	return pageMapLast{f: f, txID: txID, sections: sections}, err
+}
+
+func keepPageMap(f *os.File, path string) error {
+	if err := internal.Fsync(f); err != nil {
+		return fmt.Errorf("sync the page map: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close the page map: %w", err)
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return fmt.Errorf("keep the page map: %w", err)
+	}
 	return nil
 }
