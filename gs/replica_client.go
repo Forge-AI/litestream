@@ -188,12 +188,13 @@ func (c *ReplicaClient) WriteHeadIf(ctx context.Context, key string, r *io.Secti
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	w := c.bkt.Object(key).If(conditions).NewWriter(writeCtx)
-	if _, err := io.Copy(w, r); err != nil {
+	_, err := io.Copy(w, r)
+	if err != nil {
 		cancel()
-		return "", err
 	}
+	err = errors.Join(err, w.Close())
 	var apiErr *googleapi.Error
-	if err := w.Close(); errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+	if errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
 		return "", litestream.ErrHeadMoved
 	} else if err != nil {
 		return "", err

@@ -215,7 +215,7 @@ func planPageMap(known []*ltx.FileInfo, base, txID ltx.TXID) []*ltx.FileInfo {
 	var plan []*ltx.FileInfo
 	at := base
 	for _, info := range known {
-		if info.Level == SnapshotLevel && info.MaxTXID <= txID && info.MaxTXID > at {
+		if info.Level == SnapshotLevel && info.MaxTXID <= txID && info.MaxTXID >= at {
 			plan, at = []*ltx.FileInfo{info}, info.MaxTXID
 		}
 	}

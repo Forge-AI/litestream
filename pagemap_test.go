@@ -496,6 +496,38 @@ func TestPageMap_EveryEightUploadsMakeOnePutAndNoReadAfterOneUploadOrAHundred(t 
 func TestPageMap_AForkedChildMapsItsOwnFilesFromItsBase(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
+	rig, base := forkedChild(t, ctx)
+	rig.uploads(t, ctx, 11, litestream.PageMapUploadsPerPublish)
+
+	last := rig.db.Replica.Pos().TXID
+	m := rig.requireRuns(t, ctx)
+	if m.Files[0].Min != base+1 || last-m.TXID >= litestream.PageMapUploadsPerPublish {
+		t.Fatalf("the child's map starts at %s and reaches %s, want its first upload after its base %s and at most %d uploads behind %s", m.Files[0].Min, m.TXID, base, litestream.PageMapUploadsPerPublish-1, last)
+	}
+	l1, err := rig.db.Compact(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := rig.requireRuns(t, ctx); m.TXID != l1.MaxTXID || len(m.Files) != 1 || m.Files[0].Level != 1 || m.Files[0].Min != base+1 {
+		t.Fatalf("the child's map after a compaction is at %s over %+v, want the level 1 file from %s to %s alone", m.TXID, m.Files, base+1, l1.MaxTXID)
+	}
+}
+
+func TestPageMap_AForkedChildsSnapshotAtItsBaseMapsTheSnapshot(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	rig, base := forkedChild(t, ctx)
+	snapshot, err := rig.db.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("a snapshot at the child's base %s: %v", base, err)
+	}
+	if m := rig.requireRuns(t, ctx); m.TXID != base || len(m.Files) != 1 || m.Files[0].Level != litestream.SnapshotLevel || m.Files[0].Max != snapshot.MaxTXID {
+		t.Fatalf("the child's map after a snapshot at its base %s is at %s over %+v, want the snapshot alone", base, m.TXID, m.Files)
+	}
+}
+
+func forkedChild(t *testing.T, ctx context.Context) (*pageMapRig, ltx.TXID) {
+	t.Helper()
 	dir := t.TempDir()
 
 	parentPath := filepath.Join(dir, "parent")
@@ -543,20 +575,7 @@ func TestPageMap_AForkedChildMapsItsOwnFilesFromItsBase(t *testing.T) {
 	if proof, err := child.ProveHandover(ctx); err != nil || !proof.Continued {
 		t.Fatalf("a child at its base's TXID %s must continue: %+v (%v)", base, proof, err)
 	}
-	rig.uploads(t, ctx, 11, litestream.PageMapUploadsPerPublish)
-
-	last := child.Replica.Pos().TXID
-	m := rig.requireRuns(t, ctx)
-	if m.Files[0].Min != base+1 || last-m.TXID >= litestream.PageMapUploadsPerPublish {
-		t.Fatalf("the child's map starts at %s and reaches %s, want its first upload after its base %s and at most %d uploads behind %s", m.Files[0].Min, m.TXID, base, litestream.PageMapUploadsPerPublish-1, last)
-	}
-	l1, err := child.Compact(ctx, 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if m := rig.requireRuns(t, ctx); m.TXID != l1.MaxTXID || len(m.Files) != 1 || m.Files[0].Level != 1 || m.Files[0].Min != base+1 {
-		t.Fatalf("the child's map after a compaction is at %s over %+v, want the level 1 file from %s to %s alone", m.TXID, m.Files, base+1, l1.MaxTXID)
-	}
+	return rig, base
 }
 
 func TestPageMap_APublishReplacesAnOlderMapAndNeverLowersANewerOne(t *testing.T) {
