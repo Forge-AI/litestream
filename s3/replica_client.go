@@ -94,10 +94,11 @@ var skipVerifyTransport = func() *http.Transport {
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu        sync.Mutex
+	s3        *s3.Client // s3 service
+	ancestors *s3.Client
+	uploader  *manager.Uploader
+	logger    *slog.Logger
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -483,6 +484,10 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Create S3 client
 	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
+	if c.Credentials.URL != "" {
+		ancestors := litestream.CredentialSource{URL: c.Credentials.URL + "/ancestors", Token: c.Credentials.Token}
+		c.ancestors = s3.NewFromConfig(cfg, append(s3Opts, func(o *s3.Options) { o.Credentials = endpointProvider(ancestors) })...)
+	}
 
 	// Configure uploader with custom options if specified
 	uploaderOpts := []func(*manager.Uploader){}
@@ -623,12 +628,16 @@ func newTransportRetryer(attempts int) aws.Retryer {
 	})
 }
 
+func endpointProvider(source litestream.CredentialSource) aws.CredentialsProvider {
+	return aws.NewCredentialsCache(endpointcreds.New(source.URL, func(o *endpointcreds.Options) {
+		o.AuthorizationToken = source.Token
+		o.HTTPClient = &http.Client{Transport: litestream.Transport}
+	}))
+}
+
 func (c *ReplicaClient) credentialsProvider() aws.CredentialsProvider {
 	if c.Credentials.URL != "" {
-		return aws.NewCredentialsCache(endpointcreds.New(c.Credentials.URL, func(o *endpointcreds.Options) {
-			o.AuthorizationToken = c.Credentials.Token
-			o.HTTPClient = &http.Client{Transport: litestream.Transport}
-		}))
+		return endpointProvider(c.Credentials)
 	}
 	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
 		return credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, c.SessionToken)
@@ -807,7 +816,11 @@ func (c *ReplicaClient) ReadHeadVersion(ctx context.Context, key string) ([]byte
 	if err := c.Init(ctx); err != nil {
 		return nil, "", err
 	}
-	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
+	input := &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)}
+	out, err := c.s3.GetObject(ctx, input)
+	if isAccessDenied(err) && c.ancestors != nil {
+		out, err = c.ancestors.GetObject(ctx, input)
+	}
 	if isNotExists(err) {
 		return nil, "", os.ErrNotExist
 	} else if err != nil {
@@ -2015,6 +2028,11 @@ var (
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
 	neonRegex         = regexp.MustCompile(`^(.+)\.(br-[^.]+\.storage\.[^.]+\.([^.]+)\.[^.]+\.neon\.tech)$`)
 )
+
+func isAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	return errors.As(err, &apiErr) && apiErr.ErrorCode() == "AccessDenied"
+}
 
 func isNotExists(err error) bool {
 	var apiErr smithy.APIError
