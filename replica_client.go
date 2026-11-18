@@ -97,6 +97,39 @@ func FetchPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInf
 	return ltx.DecodePageIndex(bufio.NewReader(rc), info.Level, info.MinTXID, info.MaxTXID)
 }
 
+func scanPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInfo, fn func(pgno uint32, offset, size int64) error) error {
+	rc, err := fetchPageIndexData(ctx, client, info)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	r := bufio.NewReader(rc)
+	var last uint64
+	for {
+		pgno, err := binary.ReadUvarint(r)
+		if err != nil {
+			return fmt.Errorf("read page index pgno: %w", err)
+		} else if pgno == 0 {
+			return nil
+		} else if pgno <= last {
+			return fmt.Errorf("page index lists page %d after page %d", pgno, last)
+		}
+		offset, err := binary.ReadUvarint(r)
+		if err != nil {
+			return fmt.Errorf("read page index offset: %w", err)
+		}
+		size, err := binary.ReadUvarint(r)
+		if err != nil {
+			return fmt.Errorf("read page index size: %w", err)
+		}
+		if err := fn(uint32(pgno), int64(offset), int64(size)); err != nil {
+			return err
+		}
+		last = pgno
+	}
+}
+
 // FetchLTXHeader reads & returns the LTX header for the given file info.
 func FetchLTXHeader(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (ltx.Header, error) {
 	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, ltx.HeaderSize)

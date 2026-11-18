@@ -166,6 +166,21 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return w.Close()
 }
 
+// WriteHeadFrom writes one small object at a full key from r.
+func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	writeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := c.bkt.Object(key).NewWriter(writeCtx)
+	if _, err := io.Copy(w, r); err != nil {
+		cancel()
+		return err
+	}
+	return w.Close()
+}
+
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
 	if err := c.Init(ctx); err != nil {
@@ -179,10 +194,6 @@ func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error
 	}
 	defer func() { _ = r.Close() }()
 	return io.ReadAll(r)
-}
-
-func (c *ReplicaClient) PageMapKey() string {
-	return path.Join(c.Path, litestream.PageMapName)
 }
 
 // ObjectKey returns the full key of a small object of this replica.

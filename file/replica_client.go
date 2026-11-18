@@ -166,13 +166,29 @@ func (c *ReplicaClient) WriteHead(_ context.Context, key string, text []byte) er
 	return os.Rename(tmp, key)
 }
 
+// WriteHeadFrom writes one small object at a full path from r, through a rename.
+func (c *ReplicaClient) WriteHeadFrom(_ context.Context, key string, r *io.SectionReader) error {
+	if err := os.MkdirAll(filepath.Dir(key), 0o755); err != nil {
+		return err
+	}
+	tmp := key + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, r); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, key)
+}
+
 // ReadHead reads one small object at a full path.
 func (c *ReplicaClient) ReadHead(_ context.Context, key string) ([]byte, error) {
 	return os.ReadFile(key)
-}
-
-func (c *ReplicaClient) PageMapKey() string {
-	return filepath.Join(c.path, litestream.PageMapName)
 }
 
 // ObjectKey returns the full path of a small object of this replica.
