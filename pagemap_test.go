@@ -316,6 +316,7 @@ func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndARefusedDe
 	rig.client.mu.Lock()
 	rig.client.failDelete = refused
 	rig.client.mu.Unlock()
+	plant()
 	if deletes, err := write(13); err != nil || !slices.Equal(deletes, []string{retired}) || !retiredExists() {
 		t.Fatalf("a write whose delete the bucket refused with %v deleted %q and returned %v, want the one refused delete and no error", refused, deletes, err)
 	}
@@ -326,7 +327,6 @@ func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndARefusedDe
 	rig.client.mu.Lock()
 	rig.client.failDelete = nil
 	rig.client.mu.Unlock()
-	plant()
 	if deletes, err := write(14); err != nil || !slices.Equal(deletes, []string{retired}) || retiredExists() {
 		t.Fatalf("the write after a failed delete deleted %q (%v), want a retry of %s", deletes, err, retired)
 	}
