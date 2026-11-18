@@ -3410,7 +3410,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 		}
 	}
 
-	return info, db.writePageMap(ctx, info)
+	return info, db.writePageMap(ctx, info, nil, true)
 }
 
 // Snapshot writes a snapshot to the replica for the current database position.
@@ -3440,7 +3440,7 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err := db.nameCompacted(info); err != nil {
 		return info, err
 	}
-	return info, db.writePageMap(ctx, info)
+	return info, db.writePageMap(ctx, info, nil, true)
 }
 
 func (db *DB) nameCompacted(info *ltx.FileInfo) error {

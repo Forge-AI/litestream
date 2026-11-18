@@ -277,6 +277,9 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 
 	if level == 0 {
 		r.raiseCachedL0Max(info)
+		if err := r.db.writePageMap(ctx, info, f, false); err != nil {
+			r.Logger().Warn("page map not written", "txid", uint64(maxTXID), "error", err.Error())
+		}
 	}
 	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
@@ -314,6 +317,9 @@ func (r *Replica) uploadFullSnapshot(ctx context.Context, minTXID ltx.TXID) (ltx
 		return 0, fmt.Errorf("write full snapshot: %w", err)
 	}
 	r.raiseCachedL0Max(info)
+	if err := r.db.writePageMap(ctx, info, nil, false); err != nil {
+		r.Logger().Warn("page map not written", "txid", uint64(pos.TXID), "error", err.Error())
+	}
 	r.db.pendingFullSnapshots.Range(func(txID, _ any) bool {
 		if txID.(ltx.TXID) <= pos.TXID {
 			r.db.pendingFullSnapshots.Delete(txID)

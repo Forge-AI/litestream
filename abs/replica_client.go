@@ -24,6 +24,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
@@ -42,6 +43,7 @@ const ReplicaClientType = "abs"
 const MetadataKeyTimestamp = "litestreamtimestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.PageMapClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Azure Blob Storage.
 type ReplicaClient struct {
@@ -240,28 +242,49 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return err
 }
 
-// WriteHeadFrom writes one small object at a full key from r in one request.
-func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+// WriteHeadIf writes one small object at a full key from r in one request
+// only while the blob is at version, its ETag, or absent when version is
+// empty, and returns the new ETag. A failed condition returns
+// litestream.ErrHeadMoved.
+func (c *ReplicaClient) WriteHeadIf(ctx context.Context, key string, r *io.SectionReader, version string) (string, error) {
 	if err := c.Init(ctx); err != nil {
-		return err
+		return "", err
 	}
-	_, err := c.client.ServiceClient().NewContainerClient(c.Bucket).NewBlockBlobClient(key).Upload(ctx, streaming.NopCloser(r), nil)
-	return err
+	conditions := &blob.ModifiedAccessConditions{IfNoneMatch: to.Ptr(azcore.ETagAny)}
+	if version != "" {
+		conditions = &blob.ModifiedAccessConditions{IfMatch: to.Ptr(azcore.ETag(version))}
+	}
+	resp, err := c.client.ServiceClient().NewContainerClient(c.Bucket).NewBlockBlobClient(key).Upload(ctx, streaming.NopCloser(r), &blockblob.UploadOptions{
+		AccessConditions: &blob.AccessConditions{ModifiedAccessConditions: conditions},
+	})
+	if bloberror.HasCode(err, bloberror.ConditionNotMet, bloberror.BlobAlreadyExists, bloberror.BlobNotFound) {
+		return "", litestream.ErrHeadMoved
+	} else if err != nil {
+		return "", err
+	}
+	return string(*resp.ETag), nil
 }
 
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	b, _, err := c.ReadHeadVersion(ctx, key)
+	return b, err
+}
+
+// ReadHeadVersion reads one small object at a full key and its ETag.
+func (c *ReplicaClient) ReadHeadVersion(ctx context.Context, key string) ([]byte, string, error) {
 	if err := c.Init(ctx); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, nil)
 	if isNotExists(err) {
-		return nil, os.ErrNotExist
+		return nil, "", os.ErrNotExist
 	} else if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return io.ReadAll(resp.Body)
+	b, err := io.ReadAll(resp.Body)
+	return b, string(*resp.ETag), err
 }
 
 // ObjectKey returns the full key of a small object of this replica.

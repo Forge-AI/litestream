@@ -84,6 +84,7 @@ type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
+var _ litestream.PageMapClient = (*ReplicaClient)(nil)
 
 var skipVerifyTransport = func() *http.Transport {
 	transport := litestream.Transport.Clone()
@@ -769,36 +770,52 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return nil
 }
 
-// WriteHeadFrom writes one small object at a full key from r.
-func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+// WriteHeadIf writes one small object at a full key from r only while the
+// object is at version, its ETag, or absent when version is empty, and
+// returns the new ETag. A failed precondition returns litestream.ErrHeadMoved.
+func (c *ReplicaClient) WriteHeadIf(ctx context.Context, key string, r *io.SectionReader, version string) (string, error) {
 	if err := c.Init(ctx); err != nil {
-		return err
+		return "", err
 	}
-	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket:        aws.String(c.Bucket),
 		Key:           aws.String(key),
 		Body:          r,
 		ContentLength: aws.Int64(r.Size()),
-	})
-	if err != nil {
-		return fmt.Errorf("s3: put head %s: %w", key, err)
+		IfNoneMatch:   aws.String("*"),
 	}
-	return nil
+	if version != "" {
+		input.IfNoneMatch, input.IfMatch = nil, aws.String(version)
+	}
+	out, err := c.s3.PutObject(ctx, input)
+	if isPreconditionFailed(err) || isNotExists(err) {
+		return "", litestream.ErrHeadMoved
+	} else if err != nil {
+		return "", fmt.Errorf("s3: put head %s: %w", key, err)
+	}
+	return aws.ToString(out.ETag), nil
 }
 
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	b, _, err := c.ReadHeadVersion(ctx, key)
+	return b, err
+}
+
+// ReadHeadVersion reads one small object at a full key and its ETag.
+func (c *ReplicaClient) ReadHeadVersion(ctx context.Context, key string) ([]byte, string, error) {
 	if err := c.Init(ctx); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
 	if isNotExists(err) {
-		return nil, os.ErrNotExist
+		return nil, "", os.ErrNotExist
 	} else if err != nil {
-		return nil, fmt.Errorf("s3: get head %s: %w", key, err)
+		return nil, "", fmt.Errorf("s3: get head %s: %w", key, err)
 	}
 	defer func() { _ = out.Body.Close() }()
-	return io.ReadAll(out.Body)
+	b, err := io.ReadAll(out.Body)
+	return b, aws.ToString(out.ETag), err
 }
 
 // ObjectKey returns the full key of a small object of this replica.

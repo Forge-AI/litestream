@@ -111,8 +111,8 @@ func TestPageMap_AWriteReadsOnlyTheFileItUploadedAndMakesTheSameRequestsBehindOn
 		return got
 	}
 	small := measure(t, 1, 256)
-	if want := (requests{reads: 2, listed: small.listed, mapWrites: 1}); small != want {
-		t.Fatalf("a write of a 1 MiB database made %+v, want its uploaded file's page index and header read and one put, %+v", small, want)
+	if want := (requests{reads: 1, listed: small.listed, mapWrites: 1}); small != want {
+		t.Fatalf("a write of a 1 MiB database made %+v, want its uploaded file's page index read and one put, %+v", small, want)
 	}
 	if deep := measure(t, 20, 256); deep != small {
 		t.Fatalf("a write made %+v behind 20 compactions and %+v behind 1, want them equal", deep, small)
@@ -177,9 +177,9 @@ func TestPageMap_ARestartContinuesFromTheLocalCopyAndALostCopyCostsOneBucketRead
 	restart := func(id int) int {
 		rig := openPageMapRig(t, ctx, dir)
 		defer rig.close(t)
+		rig.client.taken()
 		insertHandoverRows(t, ctx, rig.sqldb, id, 1)
 		rig.ship(t, ctx)
-		rig.client.taken()
 		l1, err := rig.db.Compact(ctx, 1)
 		if err != nil {
 			t.Fatal(err)
@@ -235,9 +235,9 @@ func TestPageMap_ALocalCopyWithAFlippedByteIsReplacedFromTheBucketAndNeverRepubl
 		t.Fatal(err)
 	}
 
+	rig.client.taken()
 	insertHandoverRows(t, ctx, rig.sqldb, 12, 1)
 	rig.ship(t, ctx)
-	rig.client.taken()
 	l1, err := rig.db.Compact(ctx, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -335,7 +335,7 @@ func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndRetriesAFa
 	rig.requireMap(t, ctx)
 }
 
-func TestPageMap_AFailedUploadLeavesTheLocalCopyAndTheBucketMapUnchanged(t *testing.T) {
+func TestPageMap_AFailedPublishKeepsTheLocalCopyAndLeavesTheBucketMapForTheNextPublish(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	rig := openPageMapRig(t, ctx, t.TempDir())
@@ -351,17 +351,14 @@ func TestPageMap_AFailedUploadLeavesTheLocalCopyAndTheBucketMapUnchanged(t *test
 		t.Fatal(err)
 	}
 	rig.requireMap(t, ctx)
-	maps := func() (local, bucket []byte) {
-		local, err := os.ReadFile(filepath.Join(rig.db.MetaPath(), litestream.PageMapName))
+	bucket := func() []byte {
+		b, err := rig.client.ReadHead(ctx, rig.client.ObjectKey(litestream.PageMapName))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if bucket, err = rig.client.ReadHead(ctx, rig.client.ObjectKey(litestream.PageMapName)); err != nil {
-			t.Fatal(err)
-		}
-		return local, bucket
+		return b
 	}
-	local, bucket := maps()
+	before := bucket()
 
 	refused := errors.New("the bucket refused the put")
 	rig.client.mu.Lock()
@@ -369,14 +366,22 @@ func TestPageMap_AFailedUploadLeavesTheLocalCopyAndTheBucketMapUnchanged(t *test
 	rig.client.mu.Unlock()
 	insertHandoverRows(t, ctx, rig.sqldb, 12, 1)
 	rig.ship(t, ctx)
-	if _, err := rig.db.Compact(ctx, 1); !errors.Is(err, refused) {
+	failed, err := rig.db.Compact(ctx, 1)
+	if !errors.Is(err, refused) {
 		t.Fatalf("a compaction whose map upload failed returned %v, want %v", err, refused)
 	}
-	if afterLocal, afterBucket := maps(); !bytes.Equal(afterLocal, local) || !bytes.Equal(afterBucket, bucket) {
-		t.Fatal("a failed upload changed the local copy or the bucket's map")
+	if !bytes.Equal(bucket(), before) {
+		t.Fatal("a failed upload changed the bucket's map")
 	}
-	if _, err := os.Stat(filepath.Join(rig.db.MetaPath(), litestream.PageMapName+".tmp")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("stat the failed write's temp file: %v, want it removed", err)
+	local, err := os.ReadFile(filepath.Join(rig.db.MetaPath(), litestream.PageMapName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := decodePageMap(t, local); m.TXID != failed.MaxTXID {
+		t.Fatalf("the local copy after a failed upload is at %s, want the compaction's %s", m.TXID, failed.MaxTXID)
+	}
+	if temps, err := filepath.Glob(filepath.Join(rig.db.MetaPath(), "*.tmp")); err != nil || len(temps) != 0 {
+		t.Fatalf("the failed write left temp files %q (%v), want none", temps, err)
 	}
 
 	rig.client.mu.Lock()
@@ -434,6 +439,176 @@ func TestPageMap_EveryCompactionAndSnapshotUploadRewritesTheMapWithoutMovingItBa
 	}
 }
 
+func TestPageMap_ARunThatStopsWithoutDetachingLeavesItsMapAtMostSevenUploadsBehindWithNoBucketRead(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	rig := openPageMapRig(t, ctx, t.TempDir())
+	rig.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
+	rig.ship(t, ctx)
+	rig.uploads(t, ctx, 1, 87)
+
+	mapWrites, mapReads, deletes := rig.client.heads()
+	reads, _ := rig.client.taken()
+	last := rig.db.Replica.Pos().TXID
+	if last != 88 || len(reads) != 0 || mapReads != 0 {
+		t.Fatalf("88 uploads reached %s, read %q and read the bucket's map %d times, want txid 88 and no read", last, reads, mapReads)
+	}
+	if want := int(last) / litestream.PageMapUploadsPerPublish; mapWrites != want || len(deletes) != 1 {
+		t.Fatalf("88 uploads put the map %d times and deleted %q, want %d puts and the retired map's one delete", mapWrites, deletes, want)
+	}
+	m, _ := rig.requireBucketMap(t, ctx)
+	if last-m.TXID >= litestream.PageMapUploadsPerPublish || len(m.Files) != int(m.TXID) {
+		t.Fatalf("after 88 uploads the bucket's map is at %s over %d files, want at most %d uploads behind %s with one section per upload", m.TXID, len(m.Files), litestream.PageMapUploadsPerPublish-1, last)
+	}
+	for i, f := range m.Files {
+		if f.Level != 0 || f.Min != ltx.TXID(i+1) || f.Max != f.Min {
+			t.Fatalf("section %d maps %d/%s, want the upload of txid %d", i, f.Level, ltx.FormatFilename(f.Min, f.Max), i+1)
+		}
+	}
+}
+
+func TestPageMap_EveryEightUploadsMakeOnePutAndNoReadAfterOneUploadOrAHundred(t *testing.T) {
+	type requests struct {
+		reads, listed, mapWrites, mapReads int
+	}
+	measure := func(t *testing.T, prior int) requests {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		rig := openPageMapRig(t, ctx, t.TempDir())
+		rig.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
+		rig.ship(t, ctx)
+		rig.uploads(t, ctx, 1, prior-1)
+		rig.client.taken()
+		rig.uploads(t, ctx, prior, litestream.PageMapUploadsPerPublish)
+		mapWrites, mapReads, _ := rig.client.heads()
+		reads, listed := rig.client.taken()
+		return requests{reads: len(reads), listed: listed, mapWrites: mapWrites, mapReads: mapReads}
+	}
+	one := measure(t, 1)
+	if want := (requests{mapWrites: 1}); one != want {
+		t.Fatalf("%d uploads after the first made %+v, want one put and nothing else, %+v", litestream.PageMapUploadsPerPublish, one, want)
+	}
+	if many := measure(t, 100); many != one {
+		t.Fatalf("%d uploads made %+v after 100 uploads and %+v after 1, want them equal", litestream.PageMapUploadsPerPublish, many, one)
+	}
+}
+
+func TestPageMap_AForkedChildMapsItsOwnFilesFromItsBase(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	dir := t.TempDir()
+
+	parentPath := filepath.Join(dir, "parent")
+	parent := openHandoverPublisher(t, parentPath, file.NewReplicaClient(filepath.Join(dir, "parent-replica")))
+	sqldb := openServerSQLDB(t, ctx, parentPath)
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	insertHandoverRows(t, ctx, sqldb, 1, 10)
+	if err := parent.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+	headMin, base, err := parent.MaxLTX()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	childPath := filepath.Join(dir, "child")
+	copyFile(t, parentPath, childPath)
+	child := testingutil.NewDB(t, childPath)
+	if err := os.MkdirAll(child.LTXLevelDir(0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	copyFile(t, parent.LTXPath(0, headMin, base), child.LTXPath(0, headMin, base))
+	client := &pageMapRecorder{ReplicaClient: file.NewReplicaClient(filepath.Join(dir, "child-replica"))}
+	child.MonitorInterval = 0
+	child.ShutdownSyncTimeout = 0
+	child.L0Retention = 0
+	child.BaseTXID = base
+	child.Replica = litestream.NewReplicaWithClient(child, client)
+	child.Replica.MonitorEnabled = false
+	child.SetHandover(litestream.Handover{TXID: base})
+	if err := child.Open(); err != nil {
+		t.Fatal(err)
+	}
+	rig := &pageMapRig{db: child, sqldb: openServerSQLDB(t, ctx, childPath), client: client}
+	t.Cleanup(func() { rig.close(t) })
+	if proof, err := child.ProveHandover(ctx); err != nil || !proof.Continued {
+		t.Fatalf("a child at its base's TXID %s must continue: %+v (%v)", base, proof, err)
+	}
+	rig.uploads(t, ctx, 11, litestream.PageMapUploadsPerPublish)
+
+	last := child.Replica.Pos().TXID
+	m := rig.requireRuns(t, ctx)
+	if m.Files[0].Min != base+1 || last-m.TXID >= litestream.PageMapUploadsPerPublish {
+		t.Fatalf("the child's map starts at %s and reaches %s, want its first upload after its base %s and at most %d uploads behind %s", m.Files[0].Min, m.TXID, base, litestream.PageMapUploadsPerPublish-1, last)
+	}
+	l1, err := child.Compact(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m := rig.requireRuns(t, ctx); m.TXID != l1.MaxTXID || len(m.Files) != 1 || m.Files[0].Level != 1 || m.Files[0].Min != base+1 {
+		t.Fatalf("the child's map after a compaction is at %s over %+v, want the level 1 file from %s to %s alone", m.TXID, m.Files, base+1, l1.MaxTXID)
+	}
+}
+
+func TestPageMap_APublishReplacesAnOlderMapAndNeverLowersANewerOne(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	rig := openPageMapRig(t, ctx, t.TempDir())
+	rig.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
+	rig.ship(t, ctx)
+	rig.uploads(t, ctx, 1, 2*litestream.PageMapUploadsPerPublish-1)
+	key := rig.client.ObjectKey(litestream.PageMapName)
+	plant := func(txID ltx.TXID) []byte {
+		b, version, err := rig.client.ReplicaClient.ReadHeadVersion(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		binary.LittleEndian.PutUint64(b[16:], uint64(txID))
+		body := b[:len(b)-litestream.PageMapTrailerSize]
+		binary.LittleEndian.PutUint64(b[len(body):], crc64.Checksum(body, crc64.MakeTable(crc64.ISO)))
+		if _, err := rig.client.ReplicaClient.WriteHeadIf(ctx, key, io.NewSectionReader(bytes.NewReader(b), 0, int64(len(b))), version); err != nil {
+			t.Fatal(err)
+		}
+		rig.client.taken()
+		return b
+	}
+	publish := func(first int) (mapWrites, mapReads int, bucket []byte) {
+		rig.uploads(t, ctx, first, litestream.PageMapUploadsPerPublish)
+		mapWrites, mapReads, _ = rig.client.heads()
+		rig.client.taken()
+		b, err := rig.client.ReadHead(ctx, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mapWrites, mapReads, b
+	}
+
+	plant(4)
+	if mapWrites, mapReads, _ := publish(16); mapWrites != 2 || mapReads != 1 {
+		t.Fatalf("a publish over an older map put %d times and read %d, want a refused put, one read and a put", mapWrites, mapReads)
+	}
+	if m := rig.requireMap(t, ctx); m.TXID != rig.db.Replica.Pos().TXID {
+		t.Fatalf("a publish over an older map left it at %s, want %s", m.TXID, rig.db.Replica.Pos().TXID)
+	}
+
+	newer := plant(1000)
+	if mapWrites, mapReads, bucket := publish(24); mapWrites != 1 || mapReads != 1 || !bytes.Equal(bucket, newer) {
+		t.Fatalf("a publish under a newer map put %d times and read %d, want one refused put and one read that leaves it in place", mapWrites, mapReads)
+	}
+	if mapWrites, mapReads, bucket := publish(32); mapWrites != 0 || mapReads != 0 || !bytes.Equal(bucket, newer) {
+		t.Fatalf("the next publish under a newer map put %d times and read %d, want no request", mapWrites, mapReads)
+	}
+}
+
 type pageMapRecorder struct {
 	*file.ReplicaClient
 	mu         sync.Mutex
@@ -446,26 +621,26 @@ type pageMapRecorder struct {
 	failDelete error
 }
 
-func (c *pageMapRecorder) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+func (c *pageMapRecorder) WriteHeadIf(ctx context.Context, key string, r *io.SectionReader, version string) (string, error) {
 	if key == c.ObjectKey(litestream.PageMapName) {
 		c.mu.Lock()
 		c.mapWrites++
 		fail := c.failMap
 		c.mu.Unlock()
 		if fail != nil {
-			return fail
+			return "", fail
 		}
 	}
-	return c.ReplicaClient.WriteHeadFrom(ctx, key, r)
+	return c.ReplicaClient.WriteHeadIf(ctx, key, r, version)
 }
 
-func (c *pageMapRecorder) ReadHead(ctx context.Context, key string) ([]byte, error) {
+func (c *pageMapRecorder) ReadHeadVersion(ctx context.Context, key string) ([]byte, string, error) {
 	if key == c.ObjectKey(litestream.PageMapName) {
 		c.mu.Lock()
 		c.mapReads++
 		c.mu.Unlock()
 	}
-	return c.ReplicaClient.ReadHead(ctx, key)
+	return c.ReplicaClient.ReadHeadVersion(ctx, key)
 }
 
 func (c *pageMapRecorder) DeleteHead(ctx context.Context, key string) error {
@@ -569,6 +744,29 @@ func (r *pageMapRig) ship(t *testing.T, ctx context.Context) {
 	}
 }
 
+func (r *pageMapRig) uploads(t *testing.T, ctx context.Context, first, n int) {
+	t.Helper()
+	for id := first; id < first+n; id++ {
+		insertHandoverRows(t, ctx, r.sqldb, id, 1)
+		r.ship(t, ctx)
+	}
+}
+
+func (r *pageMapRig) requireRuns(t *testing.T, ctx context.Context) *pageMap {
+	t.Helper()
+	b, err := r.client.ReadHead(ctx, r.client.ObjectKey(litestream.PageMapName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := decodePageMap(t, b)
+	for _, f := range m.Files {
+		for _, run := range f.Runs {
+			runFrames(t, ctx, r.client, f, run)
+		}
+	}
+	return m
+}
+
 type pageMap struct {
 	TXID     ltx.TXID
 	PageSize uint32
@@ -644,16 +842,22 @@ func decodePageMap(t *testing.T, b []byte) *pageMap {
 
 func (r *pageMapRig) requireMap(t *testing.T, ctx context.Context) *pageMap {
 	t.Helper()
-	b, err := r.client.ReadHead(ctx, r.client.ObjectKey(litestream.PageMapName))
-	if err != nil {
-		t.Fatal(err)
-	}
+	m, b := r.requireBucketMap(t, ctx)
 	local, err := os.ReadFile(filepath.Join(r.db.MetaPath(), litestream.PageMapName))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(local, b) {
 		t.Fatalf("the local copy of %d bytes differs from the bucket's map of %d", len(local), len(b))
+	}
+	return m
+}
+
+func (r *pageMapRig) requireBucketMap(t *testing.T, ctx context.Context) (*pageMap, []byte) {
+	t.Helper()
+	b, err := r.client.ReadHead(ctx, r.client.ObjectKey(litestream.PageMapName))
+	if err != nil {
+		t.Fatal(err)
 	}
 	m := decodePageMap(t, b)
 
@@ -703,7 +907,7 @@ func (r *pageMapRig) requireMap(t *testing.T, ctx context.Context) *pageMap {
 			t.Fatalf("the map places page %d in the run %+v of %d/%s, whose frame holds other bytes than the restore", pgno, run, f.Level, ltx.FormatFilename(f.Min, f.Max))
 		}
 	}
-	return m
+	return m, b
 }
 
 func runFrames(t *testing.T, ctx context.Context, client litestream.ReplicaClient, f pageMapFile, run pageMapRun) map[uint32][]byte {

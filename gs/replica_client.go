@@ -11,12 +11,14 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strconv"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/superfly/ltx"
 	"golang.org/x/oauth2"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 
@@ -35,6 +37,7 @@ const ReplicaClientType = "gs"
 const MetadataKeyTimestamp = "litestream-timestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.PageMapClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Google Cloud Storage.
 type ReplicaClient struct {
@@ -166,34 +169,58 @@ func (c *ReplicaClient) WriteHead(ctx context.Context, key string, text []byte) 
 	return w.Close()
 }
 
-// WriteHeadFrom writes one small object at a full key from r.
-func (c *ReplicaClient) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
+// WriteHeadIf writes one small object at a full key from r only while the
+// object is at version, its generation, or absent when version is empty, and
+// returns the new generation. A failed precondition returns
+// litestream.ErrHeadMoved.
+func (c *ReplicaClient) WriteHeadIf(ctx context.Context, key string, r *io.SectionReader, version string) (string, error) {
 	if err := c.Init(ctx); err != nil {
-		return err
+		return "", err
+	}
+	conditions := storage.Conditions{DoesNotExist: true}
+	if version != "" {
+		generation, err := strconv.ParseInt(version, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("gs: generation %q: %w", version, err)
+		}
+		conditions = storage.Conditions{GenerationMatch: generation}
 	}
 	writeCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	w := c.bkt.Object(key).NewWriter(writeCtx)
+	w := c.bkt.Object(key).If(conditions).NewWriter(writeCtx)
 	if _, err := io.Copy(w, r); err != nil {
 		cancel()
-		return err
+		return "", err
 	}
-	return w.Close()
+	var apiErr *googleapi.Error
+	if err := w.Close(); errors.As(err, &apiErr) && apiErr.Code == http.StatusPreconditionFailed {
+		return "", litestream.ErrHeadMoved
+	} else if err != nil {
+		return "", err
+	}
+	return strconv.FormatInt(w.Attrs().Generation, 10), nil
 }
 
 // ReadHead reads one small object at a full key.
 func (c *ReplicaClient) ReadHead(ctx context.Context, key string) ([]byte, error) {
+	b, _, err := c.ReadHeadVersion(ctx, key)
+	return b, err
+}
+
+// ReadHeadVersion reads one small object at a full key and its generation.
+func (c *ReplicaClient) ReadHeadVersion(ctx context.Context, key string) ([]byte, string, error) {
 	if err := c.Init(ctx); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	r, err := c.bkt.Object(key).NewReader(ctx)
 	if isNotExists(err) {
-		return nil, os.ErrNotExist
+		return nil, "", os.ErrNotExist
 	} else if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer func() { _ = r.Close() }()
-	return io.ReadAll(r)
+	b, err := io.ReadAll(r)
+	return b, strconv.FormatInt(r.Attrs.Generation, 10), err
 }
 
 // ObjectKey returns the full key of a small object of this replica.
