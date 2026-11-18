@@ -196,6 +196,7 @@ func planPageMap(known []*ltx.FileInfo, txID ltx.TXID) []*ltx.FileInfo {
 type pageMapState struct {
 	mu       sync.Mutex
 	unmapped bool
+	retired  bool
 }
 
 func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
@@ -270,10 +271,12 @@ func (db *DB) writePageMap(ctx context.Context, upload *ltx.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("encode the page map at %s: %w", plan[len(plan)-1].MaxTXID, err)
 	}
-	if last == nil {
+	// TODO: delete this once no map.pmap writer can run.
+	if !s.retired {
 		if err := client.DeleteHead(ctx, client.ObjectKey(retiredPageMapName)); err != nil {
 			return fmt.Errorf("delete the retired page map: %w", err)
 		}
+		s.retired = true
 	}
 	if err := client.WriteHeadFrom(ctx, client.ObjectKey(PageMapName), io.NewSectionReader(tmp, 0, size)); err != nil {
 		return fmt.Errorf("write the page map at %s: %w", plan[len(plan)-1].MaxTXID, err)

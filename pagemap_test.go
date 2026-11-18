@@ -208,14 +208,38 @@ func TestPageMap_ARestartContinuesFromTheLocalCopyAndALostCopyCostsOneBucketRead
 	}
 }
 
-func TestPageMap_TheFirstWriteDeletesTheRetiredMapPmapAndALaterWriteDeletesNothing(t *testing.T) {
+func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndRetriesAFailedDelete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	rig := openPageMapRig(t, ctx, t.TempDir())
+	dir := t.TempDir()
+	rig := openPageMapRig(t, ctx, dir)
 	retired := rig.client.ObjectKey("map.pmap")
-	if err := rig.client.WriteHead(ctx, retired, []byte("PMAP")); err != nil {
-		t.Fatal(err)
+	plant := func() {
+		if err := rig.client.WriteHead(ctx, retired, []byte("PMAP")); err != nil {
+			t.Fatal(err)
+		}
 	}
+	retiredExists := func() bool {
+		_, err := rig.client.ReadHead(ctx, retired)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+	write := func(id int) ([]string, error) {
+		insertHandoverRows(t, ctx, rig.sqldb, id, 1)
+		rig.ship(t, ctx)
+		rig.client.taken()
+		_, err := rig.db.Compact(ctx, 1)
+		_, _, deletes := rig.client.heads()
+		return deletes, err
+	}
+	restart := func() {
+		rig.close(t)
+		rig = openPageMapRig(t, ctx, dir)
+	}
+
+	plant()
 	rig.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
 	insertHandoverRows(t, ctx, rig.sqldb, 1, 10)
 	rig.ship(t, ctx)
@@ -223,21 +247,40 @@ func TestPageMap_TheFirstWriteDeletesTheRetiredMapPmapAndALaterWriteDeletesNothi
 	if _, err := rig.db.Snapshot(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, deletes := rig.client.heads(); !slices.Equal(deletes, []string{retired}) {
-		t.Fatalf("the first map.runs write deleted %q, want only %s", deletes, retired)
-	}
-	if _, err := rig.client.ReadHead(ctx, retired); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("read map.pmap after the first map.runs write: %v, want it gone", err)
+	if _, _, deletes := rig.client.heads(); !slices.Equal(deletes, []string{retired}) || retiredExists() {
+		t.Fatalf("the first write deleted %q, want only %s, and it gone", deletes, retired)
 	}
 
-	insertHandoverRows(t, ctx, rig.sqldb, 11, 1)
-	rig.ship(t, ctx)
-	rig.client.taken()
-	if _, err := rig.db.Compact(ctx, 1); err != nil {
-		t.Fatal(err)
+	plant()
+	if deletes, err := write(11); err != nil || len(deletes) != 0 || !retiredExists() {
+		t.Fatalf("a later write in the same process deleted %q (%v), want nothing", deletes, err)
 	}
-	if _, _, deletes := rig.client.heads(); len(deletes) != 0 {
-		t.Fatalf("the second map.runs write deleted %q, want nothing", deletes)
+
+	restart()
+	if deletes, err := write(12); err != nil || !slices.Equal(deletes, []string{retired}) || retiredExists() {
+		t.Fatalf("the first write after a restart with a local copy deleted %q (%v), want only %s, and it gone", deletes, err, retired)
+	}
+
+	restart()
+	refused := errors.New("the bucket refused the delete")
+	rig.client.mu.Lock()
+	rig.client.failDelete = refused
+	rig.client.mu.Unlock()
+	if _, err := write(13); !errors.Is(err, refused) {
+		t.Fatalf("a write whose delete failed returned %v, want %v", err, refused)
+	}
+	if mapWrites, _, _ := rig.client.heads(); mapWrites != 0 {
+		t.Fatalf("a write whose delete failed uploaded the map %d times, want 0", mapWrites)
+	}
+	rig.client.mu.Lock()
+	rig.client.failDelete = nil
+	rig.client.mu.Unlock()
+	plant()
+	if deletes, err := write(14); err != nil || !slices.Equal(deletes, []string{retired}) || retiredExists() {
+		t.Fatalf("the write after a failed delete deleted %q (%v), want a retry of %s", deletes, err, retired)
+	}
+	if deletes, err := write(15); err != nil || len(deletes) != 0 {
+		t.Fatalf("the write after the retried delete deleted %q (%v), want nothing", deletes, err)
 	}
 	rig.requireMap(t, ctx)
 }
@@ -343,13 +386,14 @@ func TestPageMap_EveryCompactionAndSnapshotUploadRewritesTheMapWithoutMovingItBa
 
 type pageMapRecorder struct {
 	*file.ReplicaClient
-	mu        sync.Mutex
-	reads     []string
-	listed    int
-	mapWrites int
-	mapReads  int
-	deletes   []string
-	failMap   error
+	mu         sync.Mutex
+	reads      []string
+	listed     int
+	mapWrites  int
+	mapReads   int
+	deletes    []string
+	failMap    error
+	failDelete error
 }
 
 func (c *pageMapRecorder) WriteHeadFrom(ctx context.Context, key string, r *io.SectionReader) error {
@@ -377,7 +421,11 @@ func (c *pageMapRecorder) ReadHead(ctx context.Context, key string) ([]byte, err
 func (c *pageMapRecorder) DeleteHead(ctx context.Context, key string) error {
 	c.mu.Lock()
 	c.deletes = append(c.deletes, key)
+	fail := c.failDelete
 	c.mu.Unlock()
+	if fail != nil {
+		return fail
+	}
 	return c.ReplicaClient.DeleteHead(ctx, key)
 }
 
