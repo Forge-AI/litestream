@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"slices"
@@ -334,7 +335,7 @@ func (db *DB) writePageMap(ctx context.Context, replica ReplicaClient, upload *l
 		return err
 	}
 	if published <= newest.MaxTXID && (always || newest.MaxTXID >= published+PageMapUploadsPerPublish) {
-		err = s.publish(ctx, client, db.MetaPath(), io.NewSectionReader(tmp, 0, size), newest.MaxTXID, version)
+		err = s.publish(ctx, db.Logger, client, db.MetaPath(), io.NewSectionReader(tmp, 0, size), newest.MaxTXID, version)
 	}
 	if err := keepPageMap(tmp, path); err != nil {
 		return err
@@ -343,13 +344,14 @@ func (db *DB) writePageMap(ctx context.Context, replica ReplicaClient, upload *l
 	return err
 }
 
-func (s *pageMapState) publish(ctx context.Context, client PageMapClient, dir string, r *io.SectionReader, txID ltx.TXID, version string) error {
+func (s *pageMapState) publish(ctx context.Context, logger *slog.Logger, client PageMapClient, dir string, r *io.SectionReader, txID ltx.TXID, version string) error {
 	// TODO: delete this once no map.pmap writer can run.
 	if !s.retired {
-		if err := client.DeleteHead(ctx, client.ObjectKey(retiredPageMapName)); err != nil {
-			return fmt.Errorf("delete the retired page map: %w", err)
+		err := client.DeleteHead(ctx, client.ObjectKey(retiredPageMapName))
+		if err != nil {
+			logger.Warn("retired page map not deleted", "error", err.Error())
 		}
-		s.retired = true
+		s.retired = err == nil
 	}
 	key := client.ObjectKey(PageMapName)
 	written, err := client.WriteHeadIf(ctx, key, io.NewSectionReader(r, 0, r.Size()), version)

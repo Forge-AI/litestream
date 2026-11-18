@@ -317,7 +317,9 @@ func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
-	if _, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil); err != nil && !isNotExists(err) {
+	_, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil)
+	var resp *azcore.ResponseError
+	if err != nil && !isNotExists(err) && !(errors.As(err, &resp) && resp.StatusCode == http.StatusNotFound) {
 		return fmt.Errorf("abs: delete head %s: %w", key, err)
 	}
 	return nil

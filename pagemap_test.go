@@ -258,7 +258,7 @@ func TestPageMap_ALocalCopyWithAFlippedByteIsReplacedFromTheBucketAndNeverRepubl
 	}
 }
 
-func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndRetriesAFailedDelete(t *testing.T) {
+func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndARefusedDeleteStillPublishesAndRetries(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	dir := t.TempDir()
@@ -316,12 +316,13 @@ func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndRetriesAFa
 	rig.client.mu.Lock()
 	rig.client.failDelete = refused
 	rig.client.mu.Unlock()
-	if _, err := write(13); !errors.Is(err, refused) {
-		t.Fatalf("a write whose delete failed returned %v, want %v", err, refused)
+	if deletes, err := write(13); err != nil || !slices.Equal(deletes, []string{retired}) || !retiredExists() {
+		t.Fatalf("a write whose delete the bucket refused with %v deleted %q and returned %v, want the one refused delete and no error", refused, deletes, err)
 	}
-	if mapWrites, _, _ := rig.client.heads(); mapWrites != 0 {
-		t.Fatalf("a write whose delete failed uploaded the map %d times, want 0", mapWrites)
+	if mapWrites, _, _ := rig.client.heads(); mapWrites != 1 {
+		t.Fatalf("a write whose delete the bucket refused uploaded the map %d times, want 1", mapWrites)
 	}
+	rig.requireMap(t, ctx)
 	rig.client.mu.Lock()
 	rig.client.failDelete = nil
 	rig.client.mu.Unlock()

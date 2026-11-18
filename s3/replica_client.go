@@ -850,7 +850,9 @@ func (c *ReplicaClient) DeleteHead(ctx context.Context, key string) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
-	if _, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)}); err != nil {
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: aws.String(c.Bucket), Key: aws.String(key)})
+	var resp *smithyhttp.ResponseError
+	if err != nil && !isNotExists(err) && !(errors.As(err, &resp) && resp.HTTPStatusCode() == http.StatusNotFound) {
 		return fmt.Errorf("s3: delete head %s: %w", key, err)
 	}
 	return nil
