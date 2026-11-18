@@ -192,6 +192,108 @@ func TestPageMap_EveryCompactionAndSnapshotUploadRewritesTheMapWithoutMovingItBa
 	}
 }
 
+func TestPageMap_AnUnregisterCompactsTheLevelZeroTailSoTheMapReachesTheLastWriteBehindOneWriteOrAHundred(t *testing.T) {
+	unregistered := func(t *testing.T, writes int) []string {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		r := registerPageMapDB(t, ctx)
+		r.write(t, ctx, 1)
+		r.write(t, ctx, 2)
+		l1, err := r.db.Compact(ctx, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var last ltx.TXID
+		for i := range writes {
+			last = r.write(t, ctx, 3+i)
+		}
+		if behind := r.requireMap(t, ctx); behind.TXID != l1.MaxTXID || behind.TXID >= last {
+			t.Fatalf("before the unregister the map is at %s, want the level 1 compaction's %s behind the last write at %s", behind.TXID, l1.MaxTXID, last)
+		}
+
+		r.client.taken()
+		if err := r.store.UnregisterDB(ctx, r.db.Path()); err != nil {
+			t.Fatal(err)
+		}
+		reads, _ := r.client.taken()
+		if m := r.requireMap(t, ctx); m.TXID != last {
+			t.Fatalf("after the unregister of %d writes past level 1 the map is at %s, want the last write's %s", writes, m.TXID, last)
+		}
+		return reads
+	}
+	one := unregistered(t, 1)
+	hundred := unregistered(t, 100)
+	if len(one) != len(hundred) {
+		t.Fatalf("an unregister read %d files behind 1 write past level 1 and %d behind 100, want them equal: %v and %v", len(one), len(hundred), one, hundred)
+	}
+}
+
+func TestPageMap_AnUnregisterOfADatabaseItsSnapshotCoversCompactsAndMapsNothing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	r := registerPageMapDB(t, ctx)
+	r.write(t, ctx, 1)
+	r.client.mu.Lock()
+	written := r.client.mapWrites
+	r.client.mu.Unlock()
+
+	if err := r.store.UnregisterDB(ctx, r.db.Path()); err != nil {
+		t.Fatal(err)
+	}
+	r.client.mu.Lock()
+	rewritten := r.client.mapWrites - written
+	r.client.mu.Unlock()
+	itr, err := r.client.LTXFiles(ctx, 1, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l1, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l1) != 0 || rewritten != 0 {
+		t.Fatalf("an unregister whose snapshot holds the last write wrote %d level 1 files and the map %d times, want neither", len(l1), rewritten)
+	}
+}
+
+type registeredPageMapDB struct {
+	*pageMapRig
+	store *litestream.Store
+}
+
+func registerPageMapDB(t *testing.T, ctx context.Context) *registeredPageMapDB {
+	t.Helper()
+	dir := t.TempDir()
+	client := &pageMapRecorder{ReplicaClient: file.NewReplicaClient(filepath.Join(dir, "replica"))}
+	store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}, {Level: 1, Interval: 24 * time.Hour}})
+	db := litestream.NewDB(filepath.Join(dir, "db"))
+	db.SyncDriven = true
+	db.MonitorInterval = 0
+	db.RetentionEnabled = false
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := store.RegisterDB(db); err != nil {
+		t.Fatal(err)
+	}
+	r := &registeredPageMapDB{pageMapRig: &pageMapRig{db: db, sqldb: openServerSQLDB(t, ctx, db.Path()), client: client}, store: store}
+	t.Cleanup(func() {
+		_ = r.sqldb.Close()
+		_ = store.UnregisterDB(context.Background(), db.Path())
+	})
+	r.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
+	return r
+}
+
+func (r *registeredPageMapDB) write(t *testing.T, ctx context.Context, id int) ltx.TXID {
+	t.Helper()
+	insertHandoverRows(t, ctx, r.sqldb, id, 1)
+	synced, err := r.store.SyncDB(ctx, r.db.Path(), true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ltx.TXID(synced.TXID)
+}
+
 type pageMapRecorder struct {
 	*file.ReplicaClient
 	mu        sync.Mutex

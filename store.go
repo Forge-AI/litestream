@@ -344,7 +344,10 @@ func (s *Store) RegisterDB(db *DB) error {
 	return nil
 }
 
-// UnregisterDB stops monitoring the database at the provided path and closes it.
+// UnregisterDB stops monitoring the database at the provided path, closes it,
+// and compacts the level 0 files it wrote past level 1 into one level 1 file
+// ahead of that level's interval, so the page map written after it reaches the
+// last write.
 func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	if path == "" {
 		return fmt.Errorf("db path required")
@@ -380,7 +383,32 @@ func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	if err := db.Close(ctx); err != nil {
 		return fmt.Errorf("close db: %w", err)
 	}
+	if err := s.compactTail(ctx, db); err != nil {
+		db.Logger.Warn("the final level 1 compaction failed; the files past the page map stay at level 0", "error", err)
+	}
 
+	return nil
+}
+
+func (s *Store) compactTail(ctx context.Context, db *DB) error {
+	if s.levels.MaxLevel() < 1 {
+		return nil
+	}
+	db.maxLTXFileInfos.Lock()
+	tail := db.maxLTXFileInfos.m[0]
+	db.maxLTXFileInfos.Unlock()
+	if tail == nil {
+		return nil
+	}
+	db.paying.Lock()
+	defer db.paying.Unlock()
+	snapshot, err := db.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil || snapshot.MaxTXID == 0 || tail.MaxTXID <= snapshot.MaxTXID {
+		return err
+	}
+	if _, err := db.Compact(ctx, 1); !errors.Is(err, ErrNoCompaction) {
+		return err
+	}
 	return nil
 }
 
