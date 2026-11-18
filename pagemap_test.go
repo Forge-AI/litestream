@@ -208,6 +208,56 @@ func TestPageMap_ARestartContinuesFromTheLocalCopyAndALostCopyCostsOneBucketRead
 	}
 }
 
+func TestPageMap_ALocalCopyWithAFlippedByteIsReplacedFromTheBucketAndNeverRepublished(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	rig := openPageMapRig(t, ctx, t.TempDir())
+	rig.exec(t, ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, body BLOB)`)
+	insertHandoverRows(t, ctx, rig.sqldb, 1, 10)
+	rig.ship(t, ctx)
+	if _, err := rig.db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	insertHandoverRows(t, ctx, rig.sqldb, 11, 1)
+	rig.ship(t, ctx)
+	if _, err := rig.db.Compact(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	built := rig.requireMap(t, ctx)
+
+	local := filepath.Join(rig.db.MetaPath(), litestream.PageMapName)
+	b, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b[litestream.PageMapHeaderSize+len(built.Files)*litestream.PageMapFileSize+8] ^= 1
+	if err := os.WriteFile(local, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	insertHandoverRows(t, ctx, rig.sqldb, 12, 1)
+	rig.ship(t, ctx)
+	rig.client.taken()
+	l1, err := rig.db.Compact(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, mapReads, _ := rig.client.heads()
+	reads, _ := rig.client.taken()
+	uploaded := fmt.Sprintf("1/%s", ltx.FormatFilename(l1.MinTXID, l1.MaxTXID))
+	for _, read := range reads {
+		if !strings.HasPrefix(read, "0/") && read != uploaded {
+			t.Fatalf("the write after a flipped byte read %s, want only the file it uploaded, %s", read, uploaded)
+		}
+	}
+	if mapReads != 1 {
+		t.Fatalf("the write after a flipped byte read the bucket's map %d times, want 1", mapReads)
+	}
+	if m := rig.requireMap(t, ctx); len(m.Files) != len(built.Files)+1 || !reflect.DeepEqual(m.Files[:len(built.Files)], built.Files) {
+		t.Fatalf("the sections after a flipped byte in the local copy are %+v, want the ones built before it, %+v", m.Files, built.Files)
+	}
+}
+
 func TestPageMap_EachProcessDeletesTheRetiredMapPmapOnItsFirstWriteAndRetriesAFailedDelete(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

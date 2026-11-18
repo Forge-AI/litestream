@@ -58,7 +58,7 @@ func TestPageMap_WritesTheSpecExampleByteForByte(t *testing.T) {
 		t.Fatalf("encoded %d bytes, reported %d:\n%s\nwant 170:\n%s", len(b), size, got, pageMapExample)
 	}
 
-	txID, sections, err := readPageMapTable(f, size)
+	txID, sections, err := readPageMap(f, size)
 	if err != nil {
 		t.Fatal(err)
 	}
