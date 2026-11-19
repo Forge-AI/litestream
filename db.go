@@ -2810,7 +2810,7 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 	if pageEncoder.page.data != nil {
 		db.lastLTXPage = &pageEncoder.page
 	}
-	db.lastStamp = timestamp
+	db.lastStamp = time.UnixMilli(timestamp.UnixMilli())
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
