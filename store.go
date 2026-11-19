@@ -525,9 +525,13 @@ type SyncDBResult struct {
 // until both WAL-to-LTX and LTX-to-remote sync complete. If checkpoint is
 // true, runs one passive checkpoint, which syncs the WAL before it. Otherwise
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
+// A non-zero stamp is written as the timestamp of every LTX file the sync
+// writes, so a caller that syncs several databases with one stamp lands each
+// of them on the same instant; a stamped sync never queues behind a full
+// snapshot, and refuses a stamp before the last file's.
 // Lock waits are context-aware: the timeout is honored while waiting for
 // the database sync executor and the replica sync lock.
-func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) (_ SyncDBResult, err error) {
+func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool, stamp time.Time) (_ SyncDBResult, err error) {
 	db := s.FindDB(path)
 	if db == nil {
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
@@ -589,7 +593,12 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) 
 		}
 	case wait:
 		phase.Store("sync_and_wait")
-		if err := db.syncAndWait(ctx, func(stage string) { phase.Store(stage) }); err != nil {
+		if err := db.syncAndWait(ctx, stamp, func(stage string) { phase.Store(stage) }); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+		}
+	case !stamp.IsZero():
+		phase.Store("sync_stamped")
+		if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting, stamp); err != nil {
 			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 		}
 	default:

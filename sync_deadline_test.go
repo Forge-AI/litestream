@@ -73,7 +73,7 @@ func TestStore_SyncDeadlineNamesInitializationAtAnyDatabaseCount(t *testing.T) {
 			defer cancel()
 			requestDone = make(chan error, 1)
 			go func() {
-				_, err := store.SyncDB(ctx, db.Path(), true, false)
+				_, err := store.SyncDB(ctx, db.Path(), true, false, time.Time{})
 				requestDone <- err
 			}()
 			select {
@@ -109,7 +109,7 @@ func TestStore_SyncDeadlineReportsOnceOnReturn(t *testing.T) {
 			store := &Store{dbs: []*DB{db}}
 			ctx, cancel := context.WithCancelCause(context.Background())
 			cancel(cause)
-			if _, err := store.SyncDB(ctx, db.Path(), false, false); !errors.Is(err, ErrDatabaseNotOpen) {
+			if _, err := store.SyncDB(ctx, db.Path(), false, false, time.Time{}); !errors.Is(err, ErrDatabaseNotOpen) {
 				t.Fatalf("sync error = %v, want database not open", err)
 			}
 			want := int64(0)
@@ -150,7 +150,7 @@ func TestStore_SyncDeadlineNamesTheStagesAfterTheLocalSync(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				_, _ = store.SyncDB(ctx, db.Path(), true, false)
+				_, _ = store.SyncDB(ctx, db.Path(), true, false, time.Time{})
 			}()
 			t.Cleanup(func() {
 				close(release)

@@ -473,7 +473,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
+	var stamp time.Time
+	if req.StampMS > 0 {
+		if req.Checkpoint {
+			writeJSONError(w, http.StatusBadRequest, "a stamped sync never checkpoints", nil)
+			return
+		}
+		stamp = time.UnixMilli(req.StampMS)
+	}
+
+	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint, stamp)
 	if err != nil {
 		switch {
 		case errors.Is(context.Cause(ctx), ErrStalled):
@@ -484,6 +493,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusConflict, err.Error(), nil)
 		case errors.Is(err, ErrSnapshotting):
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error(), nil)
+		case errors.Is(err, ErrStampBehind):
+			writeJSONError(w, http.StatusConflict, err.Error(), nil)
 		case isRefused(err):
 			writeJSONError(w, http.StatusForbidden, err.Error(), nil)
 		default:
@@ -518,6 +529,9 @@ type SyncRequest struct {
 	// Stall, in seconds, ends the sync only once it moves no bytes for that
 	// long, in place of Timeout.
 	Stall int `json:"stall,omitempty"`
+	// StampMS, in Unix milliseconds, is written as the timestamp of every LTX
+	// file this sync writes, in place of the time it writes them.
+	StampMS int64 `json:"stamp_ms,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.

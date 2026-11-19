@@ -82,6 +82,7 @@ type DB struct {
 	abandon              context.CancelFunc
 
 	lastLTXPage               *verifiedLTXPage
+	lastStamp                 time.Time
 	checkpointBarrierTaken    func()
 	checkpointBarrierReleased func()
 
@@ -324,6 +325,7 @@ type syncExecutor struct {
 	l0FileInfo *ltx.FileInfo
 	synced     bool
 	barrier    *sql.Tx
+	stamp      time.Time
 }
 
 type diagOp string
@@ -905,15 +907,15 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 // replica. Blocks until both stages complete, except that it returns
 // ErrSnapshotting instead of queueing behind a full snapshot.
 func (db *DB) SyncAndWait(ctx context.Context) error {
-	return db.syncAndWait(ctx, func(string) {})
+	return db.syncAndWait(ctx, time.Time{}, func(string) {})
 }
 
-func (db *DB) syncAndWait(ctx context.Context, stage func(string)) error {
+func (db *DB) syncAndWait(ctx context.Context, stamp time.Time, stage func(string)) error {
 	if db.Replica == nil {
 		return fmt.Errorf("no replica configured")
 	}
 
-	if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting); err != nil {
+	if err := db.syncWith(ctx, db.lockExecUnlessSnapshotting, stamp); err != nil {
 		return fmt.Errorf("db sync: %w", err)
 	}
 	stage("replica_sync")
@@ -1036,7 +1038,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
-		if _, e := db.syncLocked(ctx, 0); e != nil {
+		if _, e := db.syncLocked(ctx, 0, time.Time{}); e != nil {
 			err = e
 		}
 	}
@@ -1467,16 +1469,16 @@ func (db *DB) releaseReadLock() error {
 
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) error {
-	return db.syncWith(ctx, db.lockExec)
+	return db.syncWith(ctx, db.lockExec, time.Time{})
 }
 
-func (db *DB) syncWith(ctx context.Context, lock func(context.Context) error) error {
+func (db *DB) syncWith(ctx context.Context, lock func(context.Context) error, stamp time.Time) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return context.Cause(ctx)
 		}
 
-		result, err := db.syncOnceWith(ctx, db.MaxSyncWALBytes, lock)
+		result, err := db.syncOnceWith(ctx, db.MaxSyncWALBytes, lock, stamp)
 		if err != nil {
 			return err
 		} else if !result.synced || !result.limited || result.syncedToWALEnd {
@@ -1486,10 +1488,10 @@ func (db *DB) syncWith(ctx context.Context, lock func(context.Context) error) er
 }
 
 func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, error) {
-	return db.syncOnceWith(ctx, maxSyncWALBytes, db.lockExec)
+	return db.syncOnceWith(ctx, maxSyncWALBytes, db.lockExec, time.Time{})
 }
 
-func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func(context.Context) error) (syncResult, error) {
+func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func(context.Context) error, stamp time.Time) (syncResult, error) {
 	if err := lock(ctx); err != nil {
 		return syncResult{}, err
 	}
@@ -1499,7 +1501,7 @@ func (db *DB) syncOnceWith(ctx context.Context, maxSyncWALBytes int64, lock func
 	lifetime := db.ctx
 	db.mu.RUnlock()
 
-	return db.syncLocked(lifetime, maxSyncWALBytes)
+	return db.syncLocked(lifetime, maxSyncWALBytes, stamp)
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
@@ -1566,7 +1568,9 @@ const snapshotYieldAfter = time.Second
 
 var ErrSnapshotting = errors.New("a full snapshot holds the db sync executor")
 
-func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
+var ErrStampBehind = errors.New("a sync's stamp is before the last ltx file's stamp")
+
+func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64, stamp time.Time) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
 
@@ -1585,6 +1589,9 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		addDurationToCounter(db.syncSecondsCounter, time.Since(t))
 	}()
 
+	if !stamp.IsZero() && stamp.Before(db.lastStamp) {
+		return result, fmt.Errorf("%w: %s is before %s", ErrStampBehind, stamp.UTC().Format(time.RFC3339Nano), db.lastStamp.UTC().Format(time.RFC3339Nano))
+	}
 	exec, err := db.newSyncExecutor(ctx)
 	if err != nil {
 		return result, err
@@ -1592,6 +1599,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		db.Logger.Debug("sync: no database found")
 		return result, nil
 	}
+	exec.stamp = stamp
 	defer db.applySyncExecutor(exec, true)
 
 	// Ensure WAL has at least one frame in it.
@@ -2671,7 +2679,10 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 		"salt1", rd.salt1,
 		"salt2", rd.salt2)
 
-	timestamp := time.Now()
+	timestamp := exec.stamp
+	if timestamp.IsZero() {
+		timestamp = time.Now()
+	}
 	enc, err := ltx.NewEncoder(ltxFile)
 	if err != nil {
 		return result, span, fmt.Errorf("new ltx encoder: %w", err)
@@ -2799,13 +2810,14 @@ func (db *DB) syncSpan(ctx context.Context, checkpointing bool, exec *syncExecut
 	if pageEncoder.page.data != nil {
 		db.lastLTXPage = &pageEncoder.page
 	}
+	db.lastStamp = timestamp
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
 		Level:     0,
 		MinTXID:   txID,
 		MaxTXID:   txID,
-		CreatedAt: time.Now(),
+		CreatedAt: timestamp,
 		Size:      enc.N(),
 	}
 

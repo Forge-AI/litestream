@@ -34,7 +34,7 @@ func TestStore_SyncRunsAsLongAsItsUploadMoves(t *testing.T) {
 			defer cancel()
 
 			started := time.Now()
-			if _, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false); err != nil {
+			if _, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false, time.Time{}); err != nil {
 				t.Fatalf("sync: %v", err)
 			}
 			if tc.rows > 1 && time.Since(started) < 5*testStall {
@@ -57,7 +57,7 @@ func TestStore_SyncEndsOnceItsUploadStopsMoving(t *testing.T) {
 	ctx, cancel := db.untilStalled(t.Context(), testStall)
 	defer cancel()
 
-	_, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false)
+	_, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false, time.Time{})
 	ended := time.Now()
 	db.Replica.Client = client.ReplicaClient
 
@@ -81,7 +81,7 @@ func TestStore_SyncWarnsOfAStallOnlyWhenTheStallEndsIt(t *testing.T) {
 	defer cancel()
 	db.pay = func(context.Context) { <-ctx.Done() }
 
-	if _, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false); err != nil {
+	if _, err := (&Store{dbs: []*DB{db}}).SyncDB(ctx, db.Path(), true, false, time.Time{}); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 	if cause := context.Cause(ctx); !errors.Is(cause, ErrStalled) {

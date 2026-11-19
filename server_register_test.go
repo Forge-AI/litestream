@@ -82,7 +82,7 @@ func TestServer_ARegisteredDatabaseCheckpointsOnceASyncLeavesItsWALPastTheThresh
 		if _, err := app.Exec(`INSERT INTO t VALUES (?)`, row); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
+		if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false, time.Time{}); err != nil {
 			t.Fatal(err)
 		}
 		return idleWork([]*DB{db})
@@ -97,7 +97,7 @@ func TestServer_ARegisteredDatabaseCheckpointsOnceASyncLeavesItsWALPastTheThresh
 	if past.passive != under.passive+1 {
 		t.Fatalf("a write synced past the WAL threshold went from %+v to %+v, want one PASSIVE checkpoint", under, past)
 	}
-	if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
+	if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	if idle := idleWork([]*DB{db}); idle.passive != past.passive {
@@ -138,7 +138,7 @@ func TestServer_ARegisterAfterAStopTakesTheReplicaAndRetentionItNames(t *testing
 	if _, err := app.Exec(`INSERT INTO t VALUES (1)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := server.store.SyncDB(context.Background(), path, true, false); err != nil {
+	if _, err := server.store.SyncDB(context.Background(), path, true, false, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	if shipped, err := os.ReadDir(LTXLevelDir(moved, 0)); err != nil || len(shipped) == 0 {
@@ -165,7 +165,7 @@ func registerSynced(t *testing.T, server *Server, dir string, i int) *DB {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body)
 	}
-	if _, err := server.store.SyncDB(context.Background(), path, true, false); err != nil {
+	if _, err := server.store.SyncDB(context.Background(), path, true, false, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 	return server.store.FindDB(path)

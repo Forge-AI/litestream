@@ -294,7 +294,7 @@ func dropAndIdle(t *testing.T, n int) int64 {
 		if _, err := db.app.Exec(`INSERT INTO t VALUES (2)`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.SyncDB(context.Background(), db.path, true, false); err == nil {
+		if _, err := store.SyncDB(context.Background(), db.path, true, false, time.Time{}); err == nil {
 			t.Fatal("a sync with the network down succeeded")
 		}
 	}
@@ -303,7 +303,7 @@ func dropAndIdle(t *testing.T, n int) int64 {
 	listed := lists()
 	for _, db := range dbs {
 		written := db.client.writes.Load()
-		result, err := store.SyncDB(context.Background(), db.path, true, false)
+		result, err := store.SyncDB(context.Background(), db.path, true, false, time.Time{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -417,7 +417,7 @@ func (db *countedDB) write(t *testing.T, store *Store, i int) {
 	if _, err := db.app.Exec(`INSERT INTO t VALUES (?)`, i); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.SyncDB(context.Background(), db.path, true, false); err != nil {
+	if _, err := store.SyncDB(context.Background(), db.path, true, false, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
 }
