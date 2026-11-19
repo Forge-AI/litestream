@@ -47,6 +47,7 @@ func TestDB_CutAtSyncedOffsetResolvesWithoutAFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	synced := mustPos(t, db)
+	_, landed := l0FileAt(t, db, synced.TXID)
 
 	writePendingCut(t, db, "child", walEndOf(t, db))
 	if err := db.Sync(context.Background()); err != nil {
@@ -58,7 +59,7 @@ func TestDB_CutAtSyncedOffsetResolvesWithoutAFile(t *testing.T) {
 	} else if maxTXID != synced.TXID {
 		t.Fatalf("max txid=%s, want %s: a cut at the synced offset writes no file", maxTXID, synced.TXID)
 	}
-	if got, want := readCut(t, db, "child"), landedCutJSON(synced); got != want {
+	if got, want := readCut(t, db, "child"), landedCutJSON(landed); got != want {
 		t.Fatalf("cut=%s, want %s", got, want)
 	}
 }
@@ -214,7 +215,7 @@ func walEndOf(t *testing.T, db *DB) walPosition {
 	return walPosition{Salt1: rd.salt1, Salt2: rd.salt2, Offset: end}
 }
 
-func l0FileAt(t *testing.T, db *DB, txid ltx.TXID) (walPosition, ltx.Pos) {
+func l0FileAt(t *testing.T, db *DB, txid ltx.TXID) (walPosition, landedCut) {
 	t.Helper()
 	f, err := os.Open(db.LTXPath(0, txid, txid))
 	if err != nil {
@@ -226,7 +227,7 @@ func l0FileAt(t *testing.T, db *DB, txid ltx.TXID) (walPosition, ltx.Pos) {
 		t.Fatal(err)
 	}
 	hdr := dec.Header()
-	return walPosition{Salt1: hdr.WALSalt1, Salt2: hdr.WALSalt2, Offset: hdr.WALOffset + hdr.WALSize}, dec.PostApplyPos()
+	return walPosition{Salt1: hdr.WALSalt1, Salt2: hdr.WALSalt2, Offset: hdr.WALOffset + hdr.WALSize}, landedCut{TXID: uint64(txid), File: dec.Trailer().FileChecksum}
 }
 
 func writePendingCut(t *testing.T, db *DB, name string, at walPosition) {
@@ -257,6 +258,6 @@ func pendingCutJSON(t *testing.T, at walPosition) string {
 	return string(b)
 }
 
-func landedCutJSON(pos ltx.Pos) string {
-	return fmt.Sprintf(`{"txid":%d,"checksum":"%s"}`, uint64(pos.TXID), pos.PostApplyChecksum)
+func landedCutJSON(cut landedCut) string {
+	return fmt.Sprintf(`{"txid":%d,"file":"%s"}`, cut.TXID, cut.File)
 }
