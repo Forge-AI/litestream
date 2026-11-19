@@ -1,0 +1,50 @@
+name: sandsql-server-prod
+
+on:
+  pull_request:
+    branches: [sandsql-server-prod]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  next-twin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for commit in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git diff-tree --no-commit-id --name-only -r "$commit" | grep -qv '^\.github/'; then
+              continue
+            fi
+            twins=$(git log -1 --format='%(trailers:key=Next,valueonly)' "$commit" | tr -d '#')
+            if [ -z "$twins" ]; then
+              echo "::error::$(git log -1 --format='%h %s' "$commit") has no Next: #<pr> trailer naming its twin merged into ssql-litestream"
+              status=1
+            fi
+            for twin in $twins; do
+              landed=$(gh pr view "$twin" --repo "$GITHUB_REPOSITORY" --json state,baseRefName --jq '.state + " " + .baseRefName')
+              if [ "$landed" != "MERGED ssql-litestream" ]; then
+                echo "::error::$(git log -1 --format='%h %s' "$commit") names Next: #$twin, which is $landed, not merged into ssql-litestream"
+                status=1
+              fi
+            done
+          done
+          exit "$status"
+
+  customeredge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -count=1 ./internal/customeredge
