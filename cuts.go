@@ -25,8 +25,8 @@ func (p walPosition) sameWAL(other walPosition) bool {
 }
 
 type landedCut struct {
-	TXID     uint64       `json:"txid"`
-	Checksum ltx.Checksum `json:"checksum"`
+	TXID uint64       `json:"txid"`
+	File ltx.Checksum `json:"file"`
 }
 
 type missedCut struct {
@@ -104,9 +104,9 @@ func (db *DB) settleCuts(span walSpan, info syncInfo, prior ltx.Pos, file *ltx.P
 func (db *DB) cutVerdict(at walPosition, span walSpan, info syncInfo, prior ltx.Pos, file *ltx.Pos) (any, error) {
 	switch {
 	case file != nil && at == span.end:
-		return landedCut{TXID: uint64(file.TXID), Checksum: file.PostApplyChecksum}, nil
+		return db.landedCut(file.TXID)
 	case at == info.ltxEnd || (!info.snapshotting && at == span.start):
-		return landedCut{TXID: uint64(prior.TXID), Checksum: prior.PostApplyChecksum}, nil
+		return db.landedCut(prior.TXID)
 	case at.sameWAL(span.end) && at.Offset > span.end.Offset:
 		return nil, nil
 	case at.sameWAL(span.end):
@@ -120,6 +120,48 @@ func (db *DB) cutVerdict(at walPosition, span walSpan, info syncInfo, prior ltx.
 		return nil, nil
 	}
 	return missedCut{Missed: true}, nil
+}
+
+func (db *DB) landedCut(txid ltx.TXID) (any, error) {
+	dir := db.LTXLevelDir(0)
+	ents, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return missedCut{Missed: true}, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("list level-0 files for a cut: %w", err)
+	}
+	for _, ent := range ents {
+		if _, maxTXID, err := ltx.ParseFilename(ent.Name()); err != nil || maxTXID != txid {
+			continue
+		}
+		file, err := readLTXTrailer(filepath.Join(dir, ent.Name()))
+		if err != nil {
+			return nil, err
+		}
+		return landedCut{TXID: uint64(txid), File: file}, nil
+	}
+	return missedCut{Missed: true}, nil
+}
+
+func readLTXTrailer(path string) (ltx.Checksum, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, fmt.Errorf("open the cut's ltx file: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("stat the cut's ltx file: %w", err)
+	}
+	b := make([]byte, ltx.TrailerSize)
+	if _, err := f.ReadAt(b, fi.Size()-ltx.TrailerSize); err != nil {
+		return 0, fmt.Errorf("read the cut's ltx trailer: %w", err)
+	}
+	var trailer ltx.Trailer
+	if err := trailer.UnmarshalBinary(b); err != nil {
+		return 0, fmt.Errorf("decode the cut's ltx trailer: %w", err)
+	}
+	return trailer.FileChecksum, nil
 }
 
 func (db *DB) writeCut(name string, verdict any) error {
