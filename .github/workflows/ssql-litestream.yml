@@ -10,44 +10,91 @@ permissions:
 
 jobs:
   rebase:
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - branch: ssql-litestream
-            test: true
+    env:
+      GH_TOKEN: ${{ secrets.FORGE_REBASE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.branch }}
+          ref: ssql-litestream
           fetch-depth: 0
           token: ${{ secrets.FORGE_REBASE_TOKEN }}
-      - if: matrix.test
-        uses: actions/setup-go@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - id: before
-        run: echo "old=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - uses: imba-tjd/rebase-upstream-action@559f4270ba3c290f6009fc7114398a4ea07fa799
-        with:
-          upstream: benbjohnson/litestream
-          branch: main
-          depth: 0
-          push: false
       - id: rebase
         run: |
-          upstream=$(git rev-parse upstream/main)
-          if [ "$(git rev-parse HEAD)" = "${{ steps.before.outputs.old }}" ]; then
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch -q https://github.com/benbjohnson/litestream.git main
+          upstream=$(git rev-parse FETCH_HEAD)
+          replaced=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "$upstream" HEAD; then
             echo "current=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "tag=${{ matrix.branch }}/$(date -u +%Y%m%d)-$(git rev-parse --short=12 "$upstream")" >> "$GITHUB_OUTPUT"
-      - if: matrix.test && steps.rebase.outputs.current != 'true'
+          git rebase "$upstream"
+          {
+            echo "upstream=$upstream"
+            echo "replaced=$replaced"
+            echo "rebased=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+      - if: steps.rebase.outputs.current != 'true'
         run: go vet ./... && go test -count=1 . ./internal ./abs ./file ./gs ./nats ./s3 ./sftp ./cmd/litestream
       - if: steps.rebase.outputs.current != 'true'
+        env:
+          UPSTREAM: ${{ steps.rebase.outputs.upstream }}
+          REPLACED: ${{ steps.rebase.outputs.replaced }}
+          REBASED: ${{ steps.rebase.outputs.rebased }}
         run: |
-          git tag "${{ steps.rebase.outputs.tag }}"
-          git push origin "${{ steps.rebase.outputs.tag }}"
-          git push --force-with-lease=${{ matrix.branch }}:${{ steps.before.outputs.old }} origin HEAD:${{ matrix.branch }}
+          tag="forge/ssql-litestream/$(date -u +%Y%m%d)-${REPLACED:0:12}"
+          git tag "$tag" "$REPLACED"
+          git push origin "refs/tags/$tag"
+          git push --force-with-lease="ssql-litestream:$REPLACED" origin "$REBASED:refs/heads/ssql-litestream"
+
+          monorepo=repos/Forge-AI/monorepo
+          script=go/litestream-next/build.sh
+          branch="litestream-next-lock/${REBASED:0:12}"
+          title="sandsql: ⬆️ litestream-next locks ssql-litestream at ${REBASED:0:12}, rebased onto upstream main ${UPSTREAM:0:12}"
+          gh api "$monorepo/git/refs" -f ref="refs/heads/$branch" -f sha="$(gh api "$monorepo/git/ref/heads/dev" --jq .object.sha)" > /dev/null
+          gh api "$monorepo/contents/$script?ref=$branch" > current.json
+          jq -r .content current.json | base64 -d | sed "s/^COMMIT=\"[0-9a-f]*\"$/COMMIT=\"$REBASED\"/" > build.sh
+          gh api -X PUT "$monorepo/contents/$script" -f message="$title" -f branch="$branch" \
+            -f sha="$(jq -r .sha current.json)" -f content="$(base64 -w0 build.sh)" > /dev/null
+          gh pr create --repo Forge-AI/monorepo --base dev --head "$branch" --title "$title" --body "## Context
+
+          The nightly rebase of Forge-AI/litestream's \`ssql-litestream\` onto upstream main moved the branch from \`$REPLACED\` to \`$REBASED\`, and tagged the replaced tip \`$tag\`, so every build that locks it keeps building.
+
+          ## Summary
+
+          \`go/litestream-next/build.sh\` locks the rebased tip.
+
+          ## Show me
+
+          \`\`\`sh
+          COMMIT=\"$REBASED\"
+          \`\`\`
+
+          Upstream's own unit suite passed on the rebased tree in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID before the push.
+
+          ## Motivation
+
+          The owner's rule (Nov 19): a lock is on its branch or a \`forge/<branch>/<date>\` tag, and dev's \`litestream-locks\` step stays red until the branch tip is locked.
+
+          ## Risk profile
+
+          - **Threat model:** none new.
+          - **Availability:** this changes the litestream-next binary journal-next, cloudrunner and runtime-api ship.
+          - **Data:** SandSQL replication. Dangerous by AGENTS.md; merge only on the owner's Approve.
+
+          ## New patterns
+
+          None.
+
+          ## Design
+
+          - Rebased by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
+
+          ## Changes
+
+          - \`go/litestream-next/build.sh\`: \`COMMIT\` moves to \`$REBASED\`."
