@@ -2,7 +2,6 @@ name: sandsql-server-prod
 
 on:
   pull_request:
-    branches: [sandsql-server-prod]
 
 permissions:
   contents: read
@@ -17,11 +16,10 @@ jobs:
           fetch-depth: 0
       - env:
           GH_TOKEN: ${{ github.token }}
-          BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           status=0
-          for commit in $(git rev-list --no-merges "$BASE..$HEAD"); do
+          for commit in $(git rev-list --no-merges "origin/sandsql-server-prod..$HEAD"); do
             if ! git diff-tree --no-commit-id --name-only -r "$commit" | grep -qv '^\.github/'; then
               continue
             fi
