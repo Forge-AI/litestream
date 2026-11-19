@@ -20,7 +20,7 @@ func TestSegmentFaults_AnAbsentSegmentIsFaultedOnceBeforeItsPagesAreRead(t *test
 	binary.LittleEndian.PutUint32(states[0:], segmentPresent)
 	require.NoError(t, os.WriteFile(path+"-segments", states, 0o600))
 
-	socket := filepath.Join(dir, "fault.sock")
+	socket := faultSocketPath(t)
 	listener, err := net.Listen("unix", socket)
 	require.NoError(t, err)
 	var faulted []uint32
@@ -65,7 +65,7 @@ func TestSegmentFaults_AFailedFaultFailsTheRead(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "db")
 	require.NoError(t, os.WriteFile(path+"-segments", make([]byte, 4), 0o600))
-	socket := filepath.Join(dir, "fault.sock")
+	socket := faultSocketPath(t)
 	listener, err := net.Listen("unix", socket)
 	require.NoError(t, err)
 	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -78,4 +78,12 @@ func TestSegmentFaults_AFailedFaultFailsTheRead(t *testing.T) {
 	require.NoError(t, err)
 	defer faults.close()
 	require.ErrorContains(t, faults.ensure(context.Background(), 1), "no lane here follows it")
+}
+
+func faultSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "fs")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "fault.sock")
 }
