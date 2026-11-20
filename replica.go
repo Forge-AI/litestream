@@ -245,9 +245,18 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
+	started := time.Now()
 	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
 	if err != nil {
+		if _, pending := r.db.pendingFullSnapshots.Load(maxTXID); level == 0 && pending {
+			r.Logger().Warn("full snapshot upload failed", "txid", uint64(maxTXID), "elapsed_ms", time.Since(started).Milliseconds(), "error", err.Error())
+		}
 		return fmt.Errorf("write ltx file: %w", err)
+	}
+	if level == 0 {
+		if _, pending := r.db.pendingFullSnapshots.LoadAndDelete(maxTXID); pending {
+			r.Logger().Warn("full snapshot uploaded", "txid", uint64(maxTXID), "elapsed_ms", time.Since(started).Milliseconds(), "size_bytes", info.Size)
+		}
 	}
 
 	if level == 0 {

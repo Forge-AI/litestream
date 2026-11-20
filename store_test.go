@@ -824,20 +824,16 @@ func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
 	if _, err := sqldb.ExecContext(t.Context(), `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000) INSERT INTO t (v) SELECT randomblob(4000) FROM n;`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate); err != nil {
-		t.Fatal(err)
-	}
-
 	s := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
 	if err := s.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	synced := make(chan error, 1)
+	go func() { synced <- db.SyncAndWait(context.Background()) }()
 	<-client.started
 	require.NoError(t, s.Close(context.Background()))
 	if err := <-client.drained; err != nil {
 		require.ErrorIs(t, err, context.Canceled)
 	}
+	<-synced
 }
