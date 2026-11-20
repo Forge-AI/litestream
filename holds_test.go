@@ -137,10 +137,11 @@ func TestStore_ADatabaseDropsItsBaseRecordOncePerOpen(t *testing.T) {
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 	client := db.Replica.Client.(*file.ReplicaClient)
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
-	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now())
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 6, 10, time.Now())
 	base := client.ObjectKey(litestream.BaseName)
 
 	for pass, want := range []bool{false, true, true} {
+		createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-2*store.SnapshotRetention))
 		if err := client.WriteHead(ctx, base, []byte(`{}`)); err != nil {
 			t.Fatal(err)
 		}
