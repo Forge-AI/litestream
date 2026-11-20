@@ -153,6 +153,23 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	return f, nil
 }
 
+// WriteHead writes one small object at a full path, through a rename.
+func (c *ReplicaClient) WriteHead(_ context.Context, key string, text []byte) error {
+	if err := os.MkdirAll(filepath.Dir(key), 0o755); err != nil {
+		return err
+	}
+	tmp := key + ".tmp"
+	if err := os.WriteFile(tmp, text, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, key)
+}
+
+// ReadHead reads one small object at a full path.
+func (c *ReplicaClient) ReadHead(_ context.Context, key string) ([]byte, error) {
+	return os.ReadFile(key)
+}
+
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and sets it as the file's ModTime to preserve original creation time.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {

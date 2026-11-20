@@ -573,6 +573,7 @@ type InfoResponse struct {
 type RegisterDatabaseRequest struct {
 	Path              string `json:"path"`
 	ReplicaURL        string `json:"replica_url"`
+	Head              string `json:"head,omitempty"`
 	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL       WALEnd `json:"handover_wal"`
 	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
@@ -586,6 +587,7 @@ type RegisterDatabaseRequest struct {
 type RegisterDrivenRequest struct {
 	Path         string `json:"path"`
 	ReplicaURL   string `json:"replica_url"`
+	Head         string `json:"head,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL  WALEnd `json:"handover_wal"`
 	Retention    *bool  `json:"retention,omitempty"`
@@ -664,6 +666,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Create replica and attach client.
 	replica := NewReplica(db)
 	replica.Client = client
+	replica.HeadKey = req.Head
 	if req.SyncIntervalMS > 0 {
 		replica.SyncInterval = time.Duration(req.SyncIntervalMS) * time.Millisecond
 	}
@@ -745,6 +748,7 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 	replica := NewReplica(db)
 	replica.Client = client
 	replica.AutoRecoverEnabled = req.AutoRecover
+	replica.HeadKey = req.Head
 	db.Replica = replica
 
 	if err := s.store.RegisterDB(db); err != nil {
