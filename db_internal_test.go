@@ -5033,7 +5033,7 @@ func TestDB_LastPageMatch_ReusesVerifiedPage(t *testing.T) {
 		if err := dec.DecodeHeader(); err != nil {
 			t.Fatal(err)
 		}
-		if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || !match {
+		if match, err := db.lastPageMatch(writeLTXFile(t, input), dec.Header(), WALHeaderSize+frameSize, frameSize); err != nil || !match {
 			t.Fatalf("lastPageMatch = %v, %v", match, err)
 		}
 	}
@@ -5078,7 +5078,7 @@ func TestDB_LastPageMatch_RejectsChangedWAL(t *testing.T) {
 			if err := dec.DecodeHeader(); err != nil {
 				t.Fatal(err)
 			}
-			if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || match {
+			if match, err := db.lastPageMatch(writeLTXFile(t, b), dec.Header(), WALHeaderSize+frameSize, frameSize); match {
 				t.Fatalf("lastPageMatch = %v, %v", match, err)
 			}
 		})
@@ -5151,7 +5151,7 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 				}
 				frameSize := int64(WALFrameHeaderSize + db.pageSize)
 				offset := page.header.WALOffset + page.header.WALSize - frameSize
-				if match, err := db.lastPageMatch(ctx, dec, offset, frameSize); err != nil || !match {
+				if match, err := db.lastPageMatch(f, dec.Header(), offset, frameSize); err != nil || !match {
 					t.Fatalf("cached match = %v, %v", match, err)
 				}
 			}
@@ -5296,4 +5296,18 @@ func TestDB_WALIndexMaxFrame(t *testing.T) {
 			}
 		})
 	}
+}
+
+func writeLTXFile(t *testing.T, b []byte) *os.File {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "file.ltx")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = f.Close() })
+	return f
 }
