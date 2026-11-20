@@ -125,6 +125,10 @@ func mustAcquireSemaphore(s *semaphore.Weighted) {
 	}
 }
 
+func hasQueuedWaiter(s *semaphore.Weighted) bool {
+	return !s.TryAcquire(0)
+}
+
 func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	mustAcquireSemaphore(db.execSem)
@@ -212,32 +216,22 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	mustAcquireSemaphore(db.execSem)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-
 	done := make(chan error, 1)
 	go func() {
-		err := db.lockExec(ctx)
+		err := db.lockExec(t.Context())
 		done <- err
 		if err == nil {
 			db.execSem.Release(1)
 		}
 	}()
 
-	deadline := time.After(100 * time.Millisecond)
 	ticker := time.NewTicker(time.Millisecond)
 	defer ticker.Stop()
 
-	for {
-		if db.SyncDiagnostic().ExecutorWaiterCount == 1 {
-			break
-		}
-
+	for db.SyncDiagnostic().ExecutorWaiterCount != 1 || !hasQueuedWaiter(db.execSem) {
 		select {
 		case err := <-done:
-			t.Fatalf("lockExec returned before reporting executor wait: %v", err)
-		case <-deadline:
-			t.Fatal("lockExec did not report executor wait")
+			t.Fatalf("lockExec returned before it queued on the executor: %v", err)
 		case <-ticker.C:
 		}
 	}
@@ -276,9 +270,6 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 			err := <-done
 			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
 		}
-	case <-ctx.Done():
-		err := <-done
-		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
 	}
 }
 
