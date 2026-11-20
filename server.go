@@ -39,6 +39,10 @@ type Server struct {
 	// SocketPath is the path to the Unix socket.
 	SocketPath string
 
+	// Listener, when set, is a socket the parent bound and handed down; Start
+	// serves on it and never binds SocketPath.
+	Listener net.Listener
+
 	// SocketPerms is the file permissions for the socket.
 	SocketPerms uint32
 
@@ -99,33 +103,15 @@ func NewServer(store *Store) *Server {
 
 // Start begins listening for control connections.
 func (s *Server) Start() error {
-	if s.SocketPath == "" {
-		return fmt.Errorf("socket path required")
-	}
-
-	// Check if socket file exists and is actually a socket before removing
-	if info, err := os.Lstat(s.SocketPath); err == nil {
-		if info.Mode()&os.ModeSocket != 0 {
-			if err := os.Remove(s.SocketPath); err != nil {
-				return fmt.Errorf("remove existing socket: %w", err)
-			}
-		} else {
-			return fmt.Errorf("socket path exists but is not a socket: %s", s.SocketPath)
+	listener := s.Listener
+	if listener == nil {
+		bound, err := s.listen()
+		if err != nil {
+			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("check socket path: %w", err)
-	}
-
-	listener, err := net.Listen("unix", s.SocketPath)
-	if err != nil {
-		return fmt.Errorf("listen on unix socket: %w", err)
+		listener = bound
 	}
 	s.socketListener = listener
-
-	if err := os.Chmod(s.SocketPath, os.FileMode(s.SocketPerms)); err != nil {
-		listener.Close()
-		return fmt.Errorf("chmod socket: %w", err)
-	}
 
 	// Set startedAt after successful socket setup to ensure uptime reflects
 	// the actual time the server became available.
@@ -142,6 +128,36 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+func (s *Server) listen() (net.Listener, error) {
+	if s.SocketPath == "" {
+		return nil, fmt.Errorf("socket path required")
+	}
+
+	// Check if socket file exists and is actually a socket before removing
+	if info, err := os.Lstat(s.SocketPath); err == nil {
+		if info.Mode()&os.ModeSocket != 0 {
+			if err := os.Remove(s.SocketPath); err != nil {
+				return nil, fmt.Errorf("remove existing socket: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("socket path exists but is not a socket: %s", s.SocketPath)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("check socket path: %w", err)
+	}
+
+	listener, err := net.Listen("unix", s.SocketPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on unix socket: %w", err)
+	}
+
+	if err := os.Chmod(s.SocketPath, os.FileMode(s.SocketPerms)); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("chmod socket: %w", err)
+	}
+	return listener, nil
 }
 
 // Close gracefully shuts down the control server.
@@ -204,6 +220,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		status = "already_running"
 	} else {
 		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
+		db.BaseTXID = ltx.TXID(req.BaseTXID)
 		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
 			db.SetHandover(Handover{})
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
@@ -379,6 +396,7 @@ type StartRequest struct {
 	Timeout      int    `json:"timeout,omitempty"`
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL  WALEnd `json:"handover_wal"`
+	BaseTXID     uint64 `json:"base_txid,omitempty"`
 }
 
 // StartResponse is the response body for the /start endpoint.
@@ -440,10 +458,15 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	stop := context.AfterFunc(s.ctx, cancel)
 	defer stop()
-	if req.Wait && req.Timeout == 0 {
+	if req.Wait && req.Timeout == 0 && req.Stall == 0 {
 		req.Timeout = 30
 	}
-	if req.Timeout > 0 {
+	switch db := s.store.FindDB(expandedPath); {
+	case req.Stall > 0 && db != nil:
+		var cancel context.CancelFunc
+		ctx, cancel = db.untilStalled(ctx, time.Duration(req.Stall)*time.Second)
+		defer cancel()
+	case req.Timeout > 0:
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 		defer cancel()
@@ -452,6 +475,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
 		switch {
+		case errors.Is(context.Cause(ctx), ErrStalled):
+			writeJSONError(w, http.StatusGatewayTimeout, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotFound):
 			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
 		case errors.Is(err, ErrDatabaseNotOpen):
@@ -489,6 +514,9 @@ type SyncRequest struct {
 	Wait       bool   `json:"wait,omitempty"`
 	Checkpoint bool   `json:"checkpoint,omitempty"`
 	Timeout    int    `json:"timeout,omitempty"`
+	// Stall, in seconds, ends the sync only once it moves no bytes for that
+	// long, in place of Timeout.
+	Stall int `json:"stall,omitempty"`
 }
 
 // SyncResponse is the response body for the /sync endpoint.
@@ -576,6 +604,7 @@ type RegisterDatabaseRequest struct {
 	Head              string `json:"head,omitempty"`
 	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL       WALEnd `json:"handover_wal"`
+	BaseTXID          uint64 `json:"base_txid,omitempty"`
 	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
 	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
 	TruncatePageN     int    `json:"truncate_page_n,omitempty"`
@@ -591,6 +620,7 @@ type RegisterDrivenRequest struct {
 	Head          string `json:"head,omitempty"`
 	HandoverTXID  uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL   WALEnd `json:"handover_wal"`
+	BaseTXID      uint64 `json:"base_txid,omitempty"`
 	Retention     *bool  `json:"retention,omitempty"`
 	AutoRecover   bool   `json:"auto_recover,omitempty"`
 	TruncatePageN int    `json:"truncate_page_n,omitempty"`
@@ -660,6 +690,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if req.TruncatePageN != 0 {
 		db.TruncatePageN = req.TruncatePageN
 	}
+	db.BaseTXID = ltx.TXID(req.BaseTXID)
 	if req.HandoverTXID != 0 {
 		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 	}
@@ -747,6 +778,7 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 		db.TruncatePageN = req.TruncatePageN
 	}
 	db.SyncDriven = true
+	db.BaseTXID = ltx.TXID(req.BaseTXID)
 	if req.Retention != nil {
 		db.RetentionEnabled = *req.Retention
 	}

@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -77,8 +78,10 @@ type DB struct {
 	notify    chan struct{} // closes on WAL change
 	chkMu     sync.RWMutex  // checkpoint lock
 	opened    bool          // true if Open() was called and Close() not yet called
+	openedAt  time.Time
 	syncState syncState
 	syncDiag  diagState
+	moved     atomic.Int64
 	handover  handoverClaim
 
 	pendingFullSnapshots sync.Map
@@ -191,6 +194,11 @@ type DB struct {
 	// during retention enforcement. When false, cloud provider lifecycle
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
+
+	// BaseTXID is the TXID through which the database's base record reads its
+	// parent's files, so the replica holds its history that far with no file
+	// of its own. Must be set before calling Open().
+	BaseTXID ltx.TXID
 
 	// Remote replica for the database.
 	// Must be set before calling Open().
@@ -784,16 +792,18 @@ func (db *DB) deleteLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) error {
 	return nil
 }
 
-// MaxLTX returns the last LTX file written to level 0.
+// MaxLTX returns the last LTX file written to level 0 past BaseTXID, or a
+// minTXID of 0 and BaseTXID itself when level 0 holds none.
 func (db *DB) MaxLTX() (minTXID, maxTXID ltx.TXID, err error) {
 	ents, err := os.ReadDir(db.LTXLevelDir(0))
 	if os.IsNotExist(err) {
-		return 0, 0, nil // no LTX files written
+		return 0, db.BaseTXID, nil
 	} else if err != nil {
 		return 0, 0, err
 	}
 
 	// Find highest txn ID.
+	maxTXID = db.BaseTXID
 	for _, ent := range ents {
 		if min, max, err := ltx.ParseFilename(ent.Name()); err != nil {
 			continue // invalid LTX filename
@@ -828,7 +838,7 @@ func (db *DB) Pos() (ltx.Pos, error) {
 	if err != nil {
 		return ltx.Pos{}, err
 	} else if minTXID == 0 {
-		return ltx.Pos{}, nil // no replication yet
+		return ltx.Pos{TXID: maxTXID}, nil
 	}
 
 	ltxPath := db.LTXPath(0, minTXID, maxTXID)
@@ -1030,6 +1040,7 @@ func (db *DB) Open() (err error) {
 	// Mark as opened only after successful initialization.
 	db.mu.Lock()
 	db.opened = true
+	db.openedAt = time.Now()
 	db.mu.Unlock()
 
 	return nil
@@ -2004,7 +2015,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 	if db.Replica.AutoRecoverEnabled {
 		db.setSyncDiagPhase(diagPhaseInitUploadFiles)
-		if err := db.verifyUploadFiles(replicaInfo.MaxTXID); db.recoversFrom(err) {
+		if err := db.verifyUploadFiles(max(replicaInfo.MaxTXID, db.BaseTXID)); db.recoversFrom(err) {
 			if dbPos, err = db.discardUploadFiles(err); err != nil {
 				return err
 			}
@@ -2209,6 +2220,15 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 	minTXID, _, err := db.MaxLTX()
 	if err != nil {
 		return info, fmt.Errorf("max local ltx: %w", err)
+	} else if minTXID == 0 {
+		fi, err := db.f.Stat()
+		if err != nil {
+			return info, fmt.Errorf("stat database file: %w", err)
+		}
+		info.offset = WALHeaderSize
+		info.prevCommit = uint32(fi.Size() / int64(db.pageSize))
+		info.reason = "no local ltx file past the base, snapshotting"
+		return info, nil
 	}
 	ltxPath := db.LTXPath(0, minTXID, exec.pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
@@ -2911,6 +2931,8 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *o
 			continue
 		}
 
+		db.move()
+
 		// Check if the caller has canceled during processing.
 		select {
 		case <-ctx.Done():
@@ -2979,6 +3001,7 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
+		db.move()
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
@@ -3425,6 +3448,8 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 	minTXID, _, err := db.MaxLTX()
 	if err != nil {
 		return 0, fmt.Errorf("max local ltx: %w", err)
+	} else if minTXID == 0 {
+		return WALHeaderSize, nil
 	}
 	ltxPath := db.LTXPath(0, minTXID, pos.TXID)
 	f, err := os.Open(ltxPath)
