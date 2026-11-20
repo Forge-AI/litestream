@@ -59,3 +59,43 @@ func TestReplicaClient_SignsWithItsDatabasesCredentialSource(t *testing.T) {
 		t.Fatalf("listed %v, want an empty level", files)
 	}
 }
+
+func TestReplicaClient_ReadsAHeadItsOwnKeyIsRefusedWithItsDatabasesAncestorsKey(t *testing.T) {
+	credentials := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key := "DATABASEKEY"
+		if r.URL.Path == "/ancestors" {
+			key = "ANCESTORSKEY"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"AccessKeyId":%q,"SecretAccessKey":"secret","Token":"session","Expiration":"2099-01-01T00:00:00Z"}`, key)
+	}))
+	t.Cleanup(credentials.Close)
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Authorization"), "Credential=ANCESTORSKEY/") {
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>`)
+			return
+		}
+		_, _ = fmt.Fprint(w, `{"prefix":"teams/acme/sessions/parent"}`)
+	}))
+	t.Cleanup(storage.Close)
+	client, err := NewReplicaClientFromURL("s3", "test-bucket", "teams/acme/sessions/parent", url.Values{
+		"endpoint":          {storage.URL},
+		"region":            {"us-east-1"},
+		"force-path-style":  {"true"},
+		"credentials-url":   {credentials.URL},
+		"credentials-token": {"database-token"},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	base, err := client.(*ReplicaClient).ReadHead(t.Context(), "teams/acme/sessions/child/base")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(base) != `{"prefix":"teams/acme/sessions/parent"}` {
+		t.Fatalf("read %q, want the child's base record", base)
+	}
+}
