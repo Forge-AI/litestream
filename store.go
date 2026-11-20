@@ -178,7 +178,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
 		db.VerifyCompaction = s.VerifyCompaction
-		db.RetentionEnabled = s.RetentionEnabled
+		db.RetentionEnabled = s.RetentionEnabled && db.RetentionEnabled
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -329,7 +329,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
-	db.RetentionEnabled = s.RetentionEnabled
+	db.RetentionEnabled = s.RetentionEnabled && db.RetentionEnabled
 	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.

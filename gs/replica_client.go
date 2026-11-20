@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -15,7 +16,9 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/superfly/ltx"
+	"golang.org/x/oauth2"
 	"google.golang.org/api/iterator"
+	"google.golang.org/api/option"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -41,8 +44,9 @@ type ReplicaClient struct {
 	logger *slog.Logger
 
 	// GS bucket information
-	Bucket string
-	Path   string
+	Bucket      string
+	Path        string
+	Credentials litestream.CredentialSource
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -66,6 +70,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client := NewReplicaClient()
 	client.Bucket = host
 	client.Path = urlPath
+	client.Credentials = litestream.CredentialSourceFromQuery(query)
 	return client, nil
 }
 
@@ -83,7 +88,14 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	if c.client, err = storage.NewClient(context.WithoutCancel(ctx)); err != nil {
+	var opts []option.ClientOption
+	if c.Credentials.URL != "" {
+		opts = append(opts, option.WithHTTPClient(&http.Client{Transport: &oauth2.Transport{
+			Source: oauth2.ReuseTokenSource(nil, credentialTokens{c.Credentials}),
+			Base:   litestream.Transport,
+		}}))
+	}
+	if c.client, err = storage.NewClient(context.WithoutCancel(ctx), opts...); err != nil {
 		return fmt.Errorf("failed to create GCS client (bucket: %s): %w", c.Bucket, err)
 	}
 	c.bkt = c.client.Bucket(c.Bucket)
@@ -312,4 +324,24 @@ func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 
 func isNotExists(err error) bool {
 	return errors.Is(err, storage.ErrObjectNotExist)
+}
+
+type credentialTokens struct {
+	source litestream.CredentialSource
+}
+
+func (t credentialTokens) Token() (*oauth2.Token, error) {
+	var token struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+		TokenType   string `json:"token_type"`
+	}
+	if err := t.source.Fetch(context.Background(), &token); err != nil {
+		return nil, err
+	}
+	return &oauth2.Token{
+		AccessToken: token.AccessToken,
+		TokenType:   token.TokenType,
+		Expiry:      time.Now().Add(time.Duration(token.ExpiresIn) * time.Second),
+	}, nil
 }
