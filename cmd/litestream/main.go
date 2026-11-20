@@ -29,6 +29,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/internal/customeredge"
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
@@ -82,6 +83,19 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
+	shutdown, err := customeredge.StartMetrics(context.Background(), "litestream")
+	if err != nil {
+		slog.Error("customer edge metrics failed", "stage", "customer_edge_metrics", "cause", "export", "err", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			slog.Warn("customer edge metric shutdown failed", "stage", "customer_edge_metrics", "cause", "export", "err", err)
+		}
+	}()
+
 	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
