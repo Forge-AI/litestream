@@ -39,6 +39,17 @@ func startSnapshot(db *DB) {
 
 func openReplicatedDB(t *testing.T) *DB {
 	t.Helper()
+	db := openUncheckedDB(t)
+	t.Cleanup(func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	return db
+}
+
+func openUncheckedDB(t *testing.T) *DB {
+	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "db")
 	sqldb, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -57,11 +68,6 @@ func openReplicatedDB(t *testing.T) *DB {
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	})
 	return db
 }
 
@@ -373,4 +379,138 @@ func TestDB_WritesQueuedBehindAPassiveCheckpointKeepTheNextSyncIncremental(t *te
 	if want := last * (last + 1) / 2; rows != last || ids != want {
 		t.Fatalf("restored rows=%d ids=%d, want rows=%d ids=%d", rows, ids, last, want)
 	}
+}
+
+func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
+	t.Helper()
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+
+	copying := make(chan struct{})
+	var began sync.Once
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if db.runningSnapshot() {
+			began.Do(func() { close(copying) })
+			<-db.abandoned.Done()
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+	checkpointed := make(chan error, 1)
+	go func() { checkpointed <- db.Checkpoint(context.Background(), CheckpointModeTruncate) }()
+	select {
+	case <-copying:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the checkpoint took no boundary copy")
+	}
+	return checkpointed
+}
+
+func TestDB_AbandonStopsAFullCopyInsideACheckpointAndTheNextProcessLosesNothing(t *testing.T) {
+	db := openUncheckedDB(t)
+	checkpointed := holdFullCopyUntilAbandoned(t, db)
+	_, before, err := db.MaxLTX()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.Abandon()
+	if err := <-checkpointed; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Checkpoint=%v, want the full copy stopped by the abandon", err)
+	}
+	_, after, err := db.MaxLTX()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("last ltx file=%s, want %s: a stopped copy must publish no file", after, before)
+	}
+	db.openLTXFile = defaultOpenLTXFile
+	client := db.Replica.Client
+	path := db.Path()
+	db.boundary.Unlock()
+	if err := db.Close(context.Background()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Close=%v, want the owed copy reported, so no park records this position", err)
+	}
+
+	next := NewDB(path)
+	next.MonitorInterval = 0
+	next.Replica = NewReplicaWithClient(next, client)
+	next.Replica.MonitorEnabled = false
+	if err := next.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := next.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if err := next.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := next.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	opt := NewRestoreOptions()
+	opt.OutputPath = restored
+	if err := NewReplicaWithClient(nil, client).Restore(t.Context(), opt); err != nil {
+		t.Fatal(err)
+	}
+	copied, err := sql.Open("sqlite", restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copied.Close()
+	var rows int
+	if err := copied.QueryRow(`SELECT count(*) FROM t`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("restored rows=%d, want 2", rows)
+	}
+}
+
+func TestAbandonAll_ACheckpointInOneDatabaseDoesNotHoldACopyInAnother(t *testing.T) {
+	checkpointing := openUncheckedDB(t)
+	copying := openUncheckedDB(t)
+	t.Cleanup(func() {
+		_ = checkpointing.Close(context.Background())
+		_ = copying.Close(context.Background())
+	})
+	checkpointed := holdFullCopyUntilAbandoned(t, copying)
+
+	checkpointing.boundary.Lock()
+	abandoned := make(chan struct{})
+	go func() {
+		AbandonAll([]*DB{checkpointing, copying})
+		close(abandoned)
+	}()
+	select {
+	case err := <-checkpointed:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Checkpoint=%v, want the full copy stopped", err)
+		}
+	case <-time.After(10 * time.Second):
+		checkpointing.boundary.Unlock()
+		t.Fatal("the other database's checkpoint held this database's copy")
+	}
+	select {
+	case <-abandoned:
+		t.Fatal("the abandon must still wait out the checkpoint in flight")
+	default:
+	}
+	checkpointing.boundary.Unlock()
+	<-abandoned
 }
