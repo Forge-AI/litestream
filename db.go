@@ -1556,9 +1556,24 @@ func (db *DB) lockExec(ctx context.Context) error {
 	defer db.finishSyncExecutorWait()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("wait for db sync executor: %w", context.Cause(ctx))
+		return &ExecutorWaitError{Holder: db.SyncDiagnostic(), Err: context.Cause(ctx)}
 	}
 	return nil
+}
+
+// ExecutorWaitError is a sync that gave up waiting for the db sync executor,
+// with the diagnostic of the operation that held it.
+type ExecutorWaitError struct {
+	Holder SyncDiagnostic
+	Err    error
+}
+
+func (e *ExecutorWaitError) Error() string {
+	return fmt.Sprintf("wait for db sync executor: %v", e.Err)
+}
+
+func (e *ExecutorWaitError) Unwrap() error {
+	return e.Err
 }
 
 // addDurationToCounter records positive durations without allowing a clock
