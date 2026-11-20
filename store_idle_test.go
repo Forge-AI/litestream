@@ -148,6 +148,61 @@ func TestStore_ADatabaseWrittenOnceADayNamesItsUploadsAndStartsLevelOne(t *testi
 	})
 }
 
+func TestStore_ALevelCompactsOncePerIntervalAndPaysWhatItOwesAfterTheBoundary(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := NewStore(nil, CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: time.Minute},
+		})
+		store.L0Retention = 15 * time.Minute
+		store.RetentionEnabled = false
+		if err := store.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		db := registerCounted(t, store, t.TempDir(), "burst")
+		registered := store.FindDB(db.path)
+		owesLevelOne := func() bool {
+			store.mu.Lock()
+			defer store.mu.Unlock()
+			_, ok := store.owed[1][registered]
+			return ok
+		}
+
+		time.Sleep(time.Second)
+		db.write(t, store, 0)
+		time.Sleep(58 * time.Second)
+		db.write(t, store, 1)
+		time.Sleep(2 * time.Second)
+		store.pay(ctx, registered)
+		if got := len(uploadedFiles(t, db, 1)); got != 1 {
+			t.Fatalf("the first pay after the boundary left %d level-one files, want 1", got)
+		}
+
+		time.Sleep(time.Second)
+		db.write(t, store, 2)
+		if got := len(uploadedFiles(t, db, 1)); got != 1 {
+			t.Errorf("a write in the interval level one already compacted in left %d level-one files, want 1: the level compacts once per interval", got)
+		}
+		if !owesLevelOne() {
+			t.Error("the write level one could not compact yet is no longer owed")
+		}
+
+		time.Sleep(time.Minute)
+		store.pay(ctx, registered)
+		if got := len(uploadedFiles(t, db, 1)); got != 2 {
+			t.Errorf("the first pay after the next boundary left %d level-one files, want 2", got)
+		}
+
+		if err := db.app.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 type compactedName struct {
 	Level int    `json:"level"`
 	Min   uint64 `json:"min"`
