@@ -107,6 +107,8 @@ type DB struct {
 	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
 
 	owe        func(level int)
+	pay        func(ctx context.Context)
+	paying     sync.Mutex
 	registered bool
 
 	ctx    context.Context
@@ -430,6 +432,7 @@ func NewDB(path string) *DB {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
 	db.owe = func(int) {}
+	db.pay = func(context.Context) {}
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
@@ -916,6 +919,10 @@ func (db *DB) syncAndWait(ctx context.Context, stage func(string)) (ltx.TXID, er
 	if err := db.Replica.Sync(ctx); err != nil {
 		return 0, fmt.Errorf("replica sync: %w", err)
 	}
+	db.mu.Lock()
+	life := db.ctx
+	db.mu.Unlock()
+	db.pay(life)
 	return targetTXID, nil
 }
 
@@ -3429,9 +3436,6 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
-			if !isShutdownError(ctx, err) && !isRefused(err) {
-				db.owe(0)
-			}
 		}
 	}
 
@@ -3659,9 +3663,6 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		if keyed && processedAll {
 			db.settleL0Retention(key)
 		}
-		if !processedAll {
-			db.owe(0)
-		}
 		return nil
 	}
 
@@ -3686,9 +3687,6 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	if keyed && processedAll {
 		db.settleL0Retention(key)
-	}
-	if !processedAll {
-		db.owe(0)
 	}
 	return nil
 }

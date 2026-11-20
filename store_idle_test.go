@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,7 +30,6 @@ func TestStore_IdleDatabasesAfterABurstMakeNoCallsAndDoNoWork(t *testing.T) {
 		})
 		store.Logger = slog.New(countedHandler{&records})
 		store.L0Retention = 15 * time.Minute
-		store.L0RetentionCheckInterval = 5 * time.Minute
 		store.RetentionEnabled = false
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
@@ -66,6 +66,101 @@ func TestStore_IdleDatabasesAfterABurstMakeNoCallsAndDoNoWork(t *testing.T) {
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStore_AfterANetworkDropIdleDatabasesMakeNoCalls(t *testing.T) {
+	total := map[int]int64{}
+	for _, n := range []int{1, 1000} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { total[n] = dropAndIdle(t, n) })
+		})
+	}
+	if total[1000] != 1000*total[1] {
+		t.Errorf("1,000 databases made %d replica calls and one made %d, want exactly 1,000 times as many", total[1000], total[1])
+	}
+}
+
+func dropAndIdle(t *testing.T, n int) int64 {
+	store := NewStore(nil, CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Minute},
+		{Level: 2, Interval: time.Hour},
+		{Level: 3, Interval: 24 * time.Hour},
+	})
+	store.L0Retention = 15 * time.Minute
+	store.RetentionEnabled = false
+	if err := store.Open(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var down atomic.Bool
+	dir := t.TempDir()
+	dbs := make([]*countedDB, n)
+	for i := range dbs {
+		dbs[i] = registerCounted(t, store, dir, fmt.Sprint(i))
+		dbs[i].client.down = &down
+	}
+	calls := func() (sum int64) {
+		for _, db := range dbs {
+			sum += db.client.calls.Load()
+		}
+		return sum
+	}
+	lists := func() (sum int64) {
+		for _, db := range dbs {
+			sum += db.client.lists.Load()
+		}
+		return sum
+	}
+	time.Sleep(time.Second)
+	for _, db := range dbs {
+		db.write(t, store, 0)
+	}
+	time.Sleep(time.Minute)
+	for _, db := range dbs {
+		db.write(t, store, 1)
+	}
+
+	down.Store(true)
+	for _, db := range dbs {
+		if _, err := db.app.Exec(`INSERT INTO t VALUES (2)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncDB(context.Background(), db.path, true, false); err == nil {
+			t.Fatal("a sync with the network down succeeded")
+		}
+	}
+	time.Sleep(time.Second)
+	down.Store(false)
+	listed := lists()
+	for _, db := range dbs {
+		written := db.client.writes.Load()
+		result, err := store.SyncDB(context.Background(), db.path, true, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if db.client.writes.Load() == written || result.ReplicatedTXID != result.TXID {
+			t.Fatalf("the retry after the drop replicated through txid %d of %d with %d uploads, want the write the drop held uploaded", result.ReplicatedTXID, result.TXID, db.client.writes.Load()-written)
+		}
+	}
+	if relisted := lists() - listed; relisted != 0 {
+		t.Errorf("the retry after the drop listed the replica %d times for %d databases, want none: the position survives the failure", relisted, n)
+	}
+
+	landed := calls()
+	time.Sleep(2 * time.Hour)
+	synctest.Wait()
+	if idle := calls() - landed; idle != 0 {
+		t.Errorf("%d databases made %d replica calls in the two idle hours after the drop healed, want none", n, idle)
+	}
+	for _, db := range dbs {
+		if err := db.app.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return calls()
 }
 
 func TestServer_ASyncWhoseUploadIsRefusedAnswersForbidden(t *testing.T) {
@@ -139,7 +234,10 @@ func (db *countedDB) write(t *testing.T, store *Store, i int) {
 type countedClient struct {
 	ReplicaClient
 	calls    atomic.Int64
+	lists    atomic.Int64
+	writes   atomic.Int64
 	refusing atomic.Bool
+	down     *atomic.Bool
 }
 
 func (c *countedClient) call() error {
@@ -147,10 +245,16 @@ func (c *countedClient) call() error {
 	if c.refusing.Load() {
 		return refusal{}
 	}
+	if c.down != nil && c.down.Load() {
+		return errNetworkDown
+	}
 	return nil
 }
 
+var errNetworkDown = errors.New("dial tcp: connect: network is unreachable")
+
 func (c *countedClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.lists.Add(1)
 	if err := c.call(); err != nil {
 		return nil, err
 	}
@@ -168,7 +272,11 @@ func (c *countedClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := c.call(); err != nil {
 		return nil, err
 	}
-	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	info, err := c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	if err == nil {
+		c.writes.Add(1)
+	}
+	return info, err
 }
 
 func (c *countedClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
