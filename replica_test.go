@@ -3205,8 +3205,6 @@ func TestReplica_Restore_OpensPlanConcurrently(t *testing.T) {
 	}
 }
 
-// rendezvousOpenClient holds each OpenLTXFile until a second open is in
-// flight, so a restore that opens its plan serially never reaches a peak of 2.
 type rendezvousOpenClient struct {
 	litestream.ReplicaClient
 	inflight atomic.Int64
