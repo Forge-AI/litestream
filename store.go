@@ -94,10 +94,6 @@ const (
 	// DefaultHeartbeatCheckInterval controls how frequently the heartbeat
 	// monitor checks if heartbeat pings should be sent.
 	DefaultHeartbeatCheckInterval = 15 * time.Second
-
-	// DefaultDBInitTimeout is the maximum time to wait for a database to be
-	// initialized (page size known) before logging a warning.
-	DefaultDBInitTimeout = 30 * time.Second
 )
 
 // Store represents the top-level container for databases.
@@ -113,6 +109,9 @@ type Store struct {
 	ctx    context.Context
 	cancel func()
 	done   <-chan struct{}
+
+	owed  map[int]map[*DB]struct{}
+	wakes map[int]chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -170,9 +169,17 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
 		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
+		owed:                     map[int]map[*DB]struct{}{SnapshotLevel: {}},
+		wakes:                    map[int]chan struct{}{SnapshotLevel: make(chan struct{}, 1)},
+	}
+	for _, lvl := range levels {
+		s.owed[lvl.Level] = map[*DB]struct{}{}
+		s.wakes[lvl.Level] = make(chan struct{}, 1)
 	}
 
 	for _, db := range dbs {
+		db.owe = s.ower(db)
+		db.registered = true
 		db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 		db.L0Retention = s.L0Retention
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
@@ -227,6 +234,11 @@ func (s *Store) Open(ctx context.Context) error {
 	}
 	if err := openGroup.Wait(); err != nil {
 		return err
+	}
+	for _, db := range s.dbs {
+		for level := range s.owed {
+			s.owe(db, level)
+		}
 	}
 
 	// Start monitors for compactions & snapshots.
@@ -324,6 +336,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	s.mu.Unlock()
 
 	// Apply store-wide settings before opening the database.
+	db.owe = s.ower(db)
 	db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
@@ -355,6 +368,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	}
 
 	s.dbs = append(s.dbs, db)
+	db.registered = true
 	s.mu.Unlock()
 
 	// Start heartbeat monitor if heartbeat is configured and monitor isn't running.
@@ -387,6 +401,10 @@ func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	}
 
 	s.dbs = slices.Delete(s.dbs, idx, idx+1)
+	db.registered = false
+	for _, owed := range s.owed {
+		delete(owed, db)
+	}
 	s.mu.Unlock()
 
 	if err := db.Close(ctx); err != nil {
@@ -394,6 +412,62 @@ func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	}
 
 	return nil
+}
+
+func (s *Store) ower(db *DB) func(level int) {
+	return func(level int) { s.owe(db, level) }
+}
+
+func (s *Store) owe(db *DB, level int) {
+	s.mu.Lock()
+	owed, ok := s.owed[level]
+	ok = ok && db.registered
+	if ok {
+		owed[db] = struct{}{}
+	}
+	s.mu.Unlock()
+	if !ok {
+		return
+	}
+	select {
+	case s.wakes[level] <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Store) takeOwed(level int) []*DB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	owed := make([]*DB, 0, len(s.owed[level]))
+	for db := range s.owed[level] {
+		owed = append(owed, db)
+		delete(s.owed[level], db)
+	}
+	return owed
+}
+
+func (s *Store) awaitOwed(ctx context.Context, level int, at func(time.Time) time.Time) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-s.wakes[level]:
+		}
+		s.mu.Lock()
+		owed := len(s.owed[level]) > 0
+		s.mu.Unlock()
+		if !owed {
+			continue
+		}
+		timer := time.NewTimer(time.Until(at(time.Now())))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
 }
 
 // EnableDB starts replication for a registered database.
@@ -589,93 +663,59 @@ func (s *Store) SnapshotLevel() *CompactionLevel {
 func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
 	s.Logger.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
 
-	retryDeadline := time.Time{}
-	timer := time.NewTimer(time.Nanosecond)
-	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer.C:
-			// proceed
-		}
-
-		now := time.Now()
-		nextDelay := time.Until(lvl.NextCompactionAt(now))
-
-		var notReadyDBs []string
-
-		for _, db := range s.DBs() {
+	for s.awaitOwed(ctx, lvl.Level, lvl.NextCompactionAt) {
+		for _, db := range s.takeOwed(lvl.Level) {
 			if !db.IsOpen() {
 				continue // skip disabled DBs
 			}
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
-			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
+			case errors.Is(err, ErrNoCompaction):
 				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+			case errors.Is(err, ErrCompactionTooEarly):
+				s.owe(db, lvl.Level)
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
-				notReadyDBs = append(notReadyDBs, db.Path())
+			case isRefused(err):
+				db.Logger.Warn("compaction refused; the next write retries it", "level", lvl.Level, "error", err)
+				continue
 			case err != nil && !isShutdownError(ctx, err):
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
+				s.owe(db, lvl.Level)
 			}
 
 			if lvl.Level == SnapshotLevel {
-				if err := s.EnforceSnapshotRetention(ctx, db); err != nil && !isShutdownError(ctx, err) {
+				err := s.EnforceSnapshotRetention(ctx, db)
+				switch {
+				case err == nil, isShutdownError(ctx, err):
+				case isRefused(err):
+					db.Logger.Warn("snapshot retention refused; the next write retries it", "error", err)
+				default:
 					db.Logger.Error("retention enforcement failed", "error", err)
+					s.owe(db, lvl.Level)
 				}
 			}
 		}
-
-		timedOut := !retryDeadline.IsZero() && now.After(retryDeadline)
-		if len(notReadyDBs) > 0 && !timedOut {
-			if retryDeadline.IsZero() {
-				retryDeadline = now.Add(DefaultDBInitTimeout)
-			}
-			nextDelay = time.Second
-			s.Logger.Debug("scheduling retry for unready dbs", "level", lvl.Level)
-		} else {
-			if timedOut {
-				s.Logger.Warn("timeout waiting for db initialization",
-					"level", lvl.Level,
-					"dbs", notReadyDBs,
-					"timeout", DefaultDBInitTimeout,
-					"hint", "database may have corrupted local state or blocked transactions; try removing -litestream directory and restarting")
-			}
-			retryDeadline = time.Time{}
-		}
-
-		if nextDelay < 0 {
-			nextDelay = 0
-		}
-		timer.Reset(nextDelay)
 	}
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
 	s.Logger.Info("starting L0 retention monitor", "interval", s.L0RetentionCheckInterval, "retention", s.L0Retention)
 
-	ticker := time.NewTicker(s.L0RetentionCheckInterval)
-	defer ticker.Stop()
-
-LOOP:
-	for {
-		select {
-		case <-ctx.Done():
-			break LOOP
-		case <-ticker.C:
-		}
-
-		for _, db := range s.DBs() {
+	after := func(now time.Time) time.Time { return now.Add(s.L0RetentionCheckInterval) }
+	for s.awaitOwed(ctx, 0, after) {
+		for _, db := range s.takeOwed(0) {
 			if !db.IsOpen() {
 				continue // skip disabled DBs
 			}
-			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-				if isShutdownError(ctx, err) {
-					continue
-				}
+			err := db.EnforceL0RetentionByTime(ctx)
+			switch {
+			case err == nil, isShutdownError(ctx, err):
+			case isRefused(err):
+				db.Logger.Warn("l0 retention refused; the next write retries it", "path", db.Path(), "error", err)
+			default:
 				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
+				s.owe(db, 0)
 			}
 		}
 	}

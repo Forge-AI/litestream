@@ -223,6 +223,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			return result, err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
+		r.db.owe(1)
 		result.synced = true
 		syncedFileN++
 	}
