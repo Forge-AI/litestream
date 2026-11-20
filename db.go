@@ -60,23 +60,24 @@ const (
 // finish (issue #724), and TRUNCATE drops the read transaction, after which
 // only a full copy under SQLite's write lock recovers the commits it folded in.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	opened    bool          // true if Open() was called and Close() not yet called
-	openedAt  time.Time
-	syncState syncState
-	syncDiag  diagState
-	moved     atomic.Int64
-	handover  handoverClaim
-	cuts      cuts
+	mu          sync.RWMutex
+	execSem     *semaphore.Weighted
+	path        string        // part to database
+	metaPath    string        // Path to the database metadata.
+	db          *sql.DB       // target database
+	f           *os.File      // long-running db file descriptor
+	rtx         *sql.Tx       // long running read transaction
+	pageSize    int           // page size, in bytes
+	notify      chan struct{} // closes on WAL change
+	chkMu       sync.RWMutex  // checkpoint lock
+	opened      bool          // true if Open() was called and Close() not yet called
+	openedAt    time.Time
+	syncState   syncState
+	syncDiag    diagState
+	moved       atomic.Int64
+	baseDropped atomic.Bool
+	handover    handoverClaim
+	cuts        cuts
 
 	pendingFullSnapshots sync.Map
 	boundary             sync.Mutex
@@ -1011,6 +1012,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
 	db.compactor.forgetHolds()
+	db.baseDropped.Store(false)
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 && !db.SyncDriven {

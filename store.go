@@ -946,10 +946,12 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 		}
 	}
 
-	if minSnapshotTXID == 0 || !db.RetentionEnabled {
+	if minSnapshotTXID == 0 || !db.RetentionEnabled || db.baseDropped.Load() {
 		return nil
 	}
-	return db.compactor.DropBase(ctx)
+	dropped, err := db.compactor.DropBase(ctx)
+	db.baseDropped.Store(dropped)
+	return err
 }
 
 // ValidationResult holds the result of validating a replica's LTX files.

@@ -91,22 +91,23 @@ func (c *Compactor) Hold(ctx context.Context, name string, hold Hold) error {
 	return nil
 }
 
-// DropBase deletes this replica's base record unless a live hold names it.
-func (c *Compactor) DropBase(ctx context.Context) error {
+// DropBase deletes this replica's base record unless a live hold names it,
+// and reports whether the record is gone.
+func (c *Compactor) DropBase(ctx context.Context) (bool, error) {
 	client, ok := c.client.(HoldClient)
 	if !ok {
-		return nil
+		return true, nil
 	}
 	c.holds.mu.Lock()
 	defer c.holds.mu.Unlock()
 	held, err := c.liveHolds(ctx, client, func(h Hold) bool { return h.Base })
 	if err != nil || len(held) > 0 {
-		return err
+		return false, err
 	}
 	if err := client.DeleteHead(ctx, client.ObjectKey(BaseName)); err != nil {
-		return fmt.Errorf("delete the base record: %w", err)
+		return false, fmt.Errorf("delete the base record: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (c *Compactor) deleteUnheld(ctx context.Context, client ReplicaClient, files []*ltx.FileInfo) error {
