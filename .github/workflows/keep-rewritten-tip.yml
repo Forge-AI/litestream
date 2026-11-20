@@ -1,0 +1,19 @@
+name: keep-rewritten-tip
+
+on:
+  push:
+    branches: [ssql-litestream, sandsql-server-prod]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.forced
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+          BRANCH: ${{ github.ref_name }}
+        run: gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/forge/$BRANCH/$(date -u +%Y%m%d)-${BEFORE:0:12}" -f sha="$BEFORE"
