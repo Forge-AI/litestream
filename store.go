@@ -447,13 +447,14 @@ type SyncDBResult struct {
 }
 
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
-// until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
+// until both WAL-to-LTX and LTX-to-remote sync complete. If checkpoint is
+// true, runs one passive checkpoint, which syncs the WAL before it. Otherwise
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
 // The returned TXID is captured before uploading; later WAL captures do not
 // advance this call's target while the upload is in progress.
 // Lock waits are context-aware: the timeout is honored while waiting for
 // the database sync executor and the replica sync lock.
-func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
+func (s *Store) SyncDB(ctx context.Context, path string, wait, checkpoint bool) (SyncDBResult, error) {
 	db := s.FindDB(path)
 	if db == nil {
 		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
@@ -468,24 +469,26 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
 	}
 
-	if wait && db.Replica == nil {
-		return SyncDBResult{}, fmt.Errorf("sync database: no replica configured")
-	}
-	if err := db.Sync(ctx); err != nil {
-		return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+	var afterTXID ltx.TXID
+	switch {
+	case checkpoint:
+		if err := db.CheckpointOutlivingCaller(ctx, CheckpointModePassive); err != nil && !isSQLiteBusyError(err) {
+			return SyncDBResult{}, fmt.Errorf("checkpoint database: %w", err)
+		}
+	case wait:
+		if afterTXID, err = db.syncAndWait(ctx, func(string) {}); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+		}
+	default:
+		if err := db.Sync(ctx); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+		}
 	}
 
-	// Pin the local capture before uploading. WAL monitoring may capture newer
-	// transactions during the upload; those are not part of this sync's target.
-	// Reading MaxLTX after Replica.Sync can otherwise report an unsynced TXID
-	// even though the requested replication completed successfully.
-	_, afterTXID, err := db.MaxLTX()
-	if err != nil {
-		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
-	}
-	if wait {
-		if err := db.Replica.Sync(ctx); err != nil {
-			return SyncDBResult{}, fmt.Errorf("sync database: replica sync: %w", err)
+	if !wait || checkpoint {
+		_, afterTXID, err = db.MaxLTX()
+		if err != nil {
+			return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
 		}
 	}
 

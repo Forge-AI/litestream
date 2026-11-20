@@ -45,7 +45,7 @@ func TestStore_SyncDB_ConcurrentCapture(t *testing.T) {
 		},
 	}
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
-	result, err := store.SyncDB(ctx, db.Path(), true)
+	result, err := store.SyncDB(ctx, db.Path(), true, false)
 	require.NoError(t, err)
 	local, err := db.Pos()
 	require.NoError(t, err)
@@ -71,7 +71,7 @@ func TestStore_SyncDB_ConcurrentCapture(t *testing.T) {
 	require.NoError(t, rows.Err())
 	require.NoError(t, rows.Close())
 	require.Equal(t, []int{1}, values)
-	next, err := store.SyncDB(ctx, db.Path(), true)
+	next, err := store.SyncDB(ctx, db.Path(), true, false)
 	require.NoError(t, err)
 	require.Equal(t, uint64(local.TXID), next.TXID)
 	require.GreaterOrEqual(t, next.ReplicatedTXID, next.TXID)

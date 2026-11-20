@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -1585,10 +1586,14 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 	}
 
 	// Create paginator for listing objects with level prefix
-	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, &s3.ListObjectsV2Input{
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(client.Bucket),
 		Prefix: aws.String(prefix),
-	})
+	}
+	if seek > 0 {
+		input.StartAfter = aws.String(prefix + ltx.FormatFilename(seek-1, ltx.TXID(math.MaxUint64)))
+	}
+	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, input)
 
 	return itr
 }
