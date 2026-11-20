@@ -659,15 +659,16 @@ type InfoResponse struct {
 
 // RegisterDatabaseRequest is the request body for the /register endpoint.
 type RegisterDatabaseRequest struct {
-	Path              string `json:"path"`
-	ReplicaURL        string `json:"replica_url"`
-	Head              string `json:"head,omitempty"`
-	HandoverTXID      uint64 `json:"handover_txid,omitempty"`
-	HandoverWAL       WALEnd `json:"handover_wal"`
-	BaseTXID          uint64 `json:"base_txid,omitempty"`
-	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
-	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
-	TruncatePageN     int    `json:"truncate_page_n,omitempty"`
+	Path                 string `json:"path"`
+	ReplicaURL           string `json:"replica_url"`
+	Head                 string `json:"head,omitempty"`
+	HandoverTXID         uint64 `json:"handover_txid,omitempty"`
+	HandoverWAL          WALEnd `json:"handover_wal"`
+	BaseTXID             uint64 `json:"base_txid,omitempty"`
+	MonitorIntervalMS    int64  `json:"monitor_interval_ms,omitempty"`
+	SyncIntervalMS       int64  `json:"sync_interval_ms,omitempty"`
+	CheckpointIntervalMS int64  `json:"checkpoint_interval_ms,omitempty"`
+	TruncatePageN        int    `json:"truncate_page_n,omitempty"`
 }
 
 // RegisterDrivenRequest is the request body for the /register-driven endpoint.
@@ -757,6 +758,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	if req.MonitorIntervalMS > 0 {
 		db.MonitorInterval = time.Duration(req.MonitorIntervalMS) * time.Millisecond
+	}
+	if req.CheckpointIntervalMS > 0 {
+		db.CheckpointInterval = time.Duration(req.CheckpointIntervalMS) * time.Millisecond
 	}
 
 	// Create replica and attach client.

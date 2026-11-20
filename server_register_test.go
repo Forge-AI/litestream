@@ -30,7 +30,7 @@ func TestServer_RegisterTakesTheDatabasesIntervals(t *testing.T) {
 		t.Fatal(err)
 	}
 	server := NewServer(NewStore(nil, CompactionLevels{{Level: 0}}))
-	body := fmt.Sprintf(`{"path": %q, "replica_url": %q, "monitor_interval_ms": 5000, "sync_interval_ms": 500}`,
+	body := fmt.Sprintf(`{"path": %q, "replica_url": %q, "monitor_interval_ms": 5000, "sync_interval_ms": 500, "checkpoint_interval_ms": 7000}`,
 		dbPath, "file://"+filepath.Join(dir, "replica"))
 	rec := httptest.NewRecorder()
 	server.handleRegister(rec, httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(body)))
@@ -44,6 +44,9 @@ func TestServer_RegisterTakesTheDatabasesIntervals(t *testing.T) {
 	}
 	if db.Replica.SyncInterval != 500*time.Millisecond {
 		t.Fatalf("sync interval=%s, want the registered 500ms", db.Replica.SyncInterval)
+	}
+	if db.CheckpointInterval != 7*time.Second {
+		t.Fatalf("checkpoint interval=%s, want the registered 7s", db.CheckpointInterval)
 	}
 }
 
