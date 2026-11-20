@@ -589,6 +589,7 @@ type RegisterDrivenRequest struct {
 	HandoverTXID uint64 `json:"handover_txid,omitempty"`
 	HandoverWAL  WALEnd `json:"handover_wal"`
 	Retention    *bool  `json:"retention,omitempty"`
+	AutoRecover  bool   `json:"auto_recover,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -743,6 +744,7 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 	}
 	replica := NewReplica(db)
 	replica.Client = client
+	replica.AutoRecoverEnabled = req.AutoRecover
 	db.Replica = replica
 
 	if err := s.store.RegisterDB(db); err != nil {
