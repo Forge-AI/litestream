@@ -39,6 +39,10 @@ type Server struct {
 	// SocketPath is the path to the Unix socket.
 	SocketPath string
 
+	// Listener, when set, is a socket the parent bound and handed down; Start
+	// serves on it and never binds SocketPath.
+	Listener net.Listener
+
 	// SocketPerms is the file permissions for the socket.
 	SocketPerms uint32
 
@@ -99,33 +103,15 @@ func NewServer(store *Store) *Server {
 
 // Start begins listening for control connections.
 func (s *Server) Start() error {
-	if s.SocketPath == "" {
-		return fmt.Errorf("socket path required")
-	}
-
-	// Check if socket file exists and is actually a socket before removing
-	if info, err := os.Lstat(s.SocketPath); err == nil {
-		if info.Mode()&os.ModeSocket != 0 {
-			if err := os.Remove(s.SocketPath); err != nil {
-				return fmt.Errorf("remove existing socket: %w", err)
-			}
-		} else {
-			return fmt.Errorf("socket path exists but is not a socket: %s", s.SocketPath)
+	listener := s.Listener
+	if listener == nil {
+		bound, err := s.listen()
+		if err != nil {
+			return err
 		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("check socket path: %w", err)
-	}
-
-	listener, err := net.Listen("unix", s.SocketPath)
-	if err != nil {
-		return fmt.Errorf("listen on unix socket: %w", err)
+		listener = bound
 	}
 	s.socketListener = listener
-
-	if err := os.Chmod(s.SocketPath, os.FileMode(s.SocketPerms)); err != nil {
-		listener.Close()
-		return fmt.Errorf("chmod socket: %w", err)
-	}
 
 	// Set startedAt after successful socket setup to ensure uptime reflects
 	// the actual time the server became available.
@@ -142,6 +128,36 @@ func (s *Server) Start() error {
 	}()
 
 	return nil
+}
+
+func (s *Server) listen() (net.Listener, error) {
+	if s.SocketPath == "" {
+		return nil, fmt.Errorf("socket path required")
+	}
+
+	// Check if socket file exists and is actually a socket before removing
+	if info, err := os.Lstat(s.SocketPath); err == nil {
+		if info.Mode()&os.ModeSocket != 0 {
+			if err := os.Remove(s.SocketPath); err != nil {
+				return nil, fmt.Errorf("remove existing socket: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("socket path exists but is not a socket: %s", s.SocketPath)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("check socket path: %w", err)
+	}
+
+	listener, err := net.Listen("unix", s.SocketPath)
+	if err != nil {
+		return nil, fmt.Errorf("listen on unix socket: %w", err)
+	}
+
+	if err := os.Chmod(s.SocketPath, os.FileMode(s.SocketPerms)); err != nil {
+		listener.Close()
+		return nil, fmt.Errorf("chmod socket: %w", err)
+	}
+	return listener, nil
 }
 
 // Close gracefully shuts down the control server.

@@ -8,7 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"sync/atomic"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -18,14 +18,14 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-var testSocketCounter uint64
-
 func testSocketPath(t *testing.T) string {
 	t.Helper()
-	n := atomic.AddUint64(&testSocketCounter, 1)
-	path := fmt.Sprintf("/tmp/ls-test-%d.sock", n)
-	t.Cleanup(func() { os.Remove(path) })
-	return path
+	dir, err := os.MkdirTemp("/tmp", "ls-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "control.sock")
 }
 
 func TestServer_HandleInfo(t *testing.T) {
@@ -58,6 +58,37 @@ func TestServer_HandleInfo(t *testing.T) {
 	require.Equal(t, 1, result.DatabaseCount)
 	require.False(t, result.StartedAt.IsZero())
 	require.GreaterOrEqual(t, result.UptimeSeconds, int64(0))
+}
+
+func TestServer_ServesOnAHandedListener(t *testing.T) {
+	store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	require.NoError(t, store.Open(t.Context()))
+	defer store.Close(t.Context())
+
+	path := testSocketPath(t)
+	held, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	require.NoError(t, err)
+	defer held.Close()
+	file, err := held.File()
+	require.NoError(t, err)
+	handed, err := net.FileListener(file)
+	require.NoError(t, file.Close())
+	require.NoError(t, err)
+
+	server := litestream.NewServer(store)
+	server.Listener = handed
+	require.NoError(t, server.Start())
+
+	resp, err := newSocketClient(t, path).Get("http://localhost/info")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	require.NoError(t, server.Close())
+	conn, err := net.Dial("unix", path)
+	require.NoError(t, err, "the parent's socket still takes connections for the next server")
+	conn.Close()
 }
 
 func TestServer_HandleList(t *testing.T) {
