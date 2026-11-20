@@ -149,8 +149,8 @@ type DB struct {
 	TruncatePageN int
 
 	// If true, the database runs no loop of its own: it syncs only when its
-	// caller calls Sync, and checkpoints PASSIVE after each sync that copied
-	// new frames in place of the threshold, interval and TRUNCATE checkpoints.
+	// caller calls Sync, and checkpoints PASSIVE once a sync that copied new
+	// frames leaves MinCheckpointPageN pages in the WAL, never on an interval.
 	SyncDriven bool
 
 	// Time between automatic checkpoints in the WAL. This is done to allow
@@ -1682,7 +1682,7 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 		return nil
 	}
 	if db.SyncDriven {
-		if !exec.state.syncedSinceCheckpoint {
+		if !exec.state.syncedSinceCheckpoint || newWALSize < calcWALSize(uint32(db.pageSize), uint32(db.MinCheckpointPageN)) {
 			return nil
 		}
 		if _, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil && !isSQLiteBusyError(err) {
