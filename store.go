@@ -111,7 +111,8 @@ type Store struct {
 	cancel func()
 	done   <-chan struct{}
 
-	owed map[int]map[*DB]struct{}
+	owed      map[int]map[*DB]struct{}
+	compacted map[int]map[*DB]time.Time
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -171,9 +172,11 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
 		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
 		owed:                     map[int]map[*DB]struct{}{SnapshotLevel: {}},
+		compacted:                map[int]map[*DB]time.Time{SnapshotLevel: {}},
 	}
 	for _, lvl := range levels {
 		s.owed[lvl.Level] = map[*DB]struct{}{}
+		s.compacted[lvl.Level] = map[*DB]time.Time{}
 	}
 
 	for _, db := range dbs {
@@ -368,6 +371,9 @@ func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	db.registered = false
 	for _, owed := range s.owed {
 		delete(owed, db)
+	}
+	for _, compacted := range s.compacted {
+		delete(compacted, db)
 	}
 	s.mu.Unlock()
 
@@ -819,6 +825,12 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 
 	// Ensure we are not re-compacting before the most recent compaction time.
 	prevCompactionAt := lvl.PrevCompactionAt(time.Now())
+	s.mu.Lock()
+	compactedAt := s.compacted[dstLevel][db]
+	s.mu.Unlock()
+	if !compactedAt.Before(prevCompactionAt) {
+		return nil, ErrCompactionTooEarly
+	}
 	dstInfo, err := db.MaxLTXFileInfo(ctx, dstLevel)
 	if err != nil {
 		return nil, fmt.Errorf("fetch dst level info: %w", err)
@@ -840,6 +852,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		if err != nil {
 			return info, err
 		}
+		s.compactedIn(db, dstLevel, prevCompactionAt)
 		db.Logger.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
 		return info, nil
 	}
@@ -871,6 +884,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	if err != nil {
 		return info, err
 	}
+	s.compactedIn(db, dstLevel, prevCompactionAt)
 
 	db.Logger.InfoContext(ctx, "compaction complete",
 		"level", dstLevel,
@@ -882,6 +896,12 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	)
 
 	return info, nil
+}
+
+func (s *Store) compactedIn(db *DB, level int, interval time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.compacted[level][db] = interval
 }
 
 // EnforceSnapshotRetention removes old snapshots by timestamp and then
