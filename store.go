@@ -425,6 +425,11 @@ func (s *Store) payLevel(ctx context.Context, db *DB, lvl *CompactionLevel) (sti
 	if !db.IsOpen() {
 		return false
 	}
+	if lvl.Level != SnapshotLevel {
+		if snapshotInfo, err := db.MaxLTXFileInfo(ctx, SnapshotLevel); err == nil && snapshotInfo.MaxTXID == 0 {
+			return true
+		}
+	}
 	_, err := s.CompactDB(ctx, db, lvl)
 	switch {
 	case err == nil:
@@ -805,6 +810,17 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	// Skip if there are no new files to compact.
 	if srcInfo.MaxTXID <= dstInfo.MaxTXID {
 		return nil, ErrNoCompaction
+	}
+
+	if dstInfo.MaxTXID == 0 {
+		snapshotInfo, err := db.MaxLTXFileInfo(ctx, SnapshotLevel)
+		if err != nil {
+			return nil, fmt.Errorf("fetch snapshot level info: %w", err)
+		} else if srcInfo.MaxTXID <= snapshotInfo.MaxTXID {
+			return nil, ErrNoCompaction
+		} else if snapshotInfo.CreatedAt.After(prevCompactionAt) {
+			return nil, ErrCompactionTooEarly
+		}
 	}
 
 	info, err := db.Compact(ctx, dstLevel)
