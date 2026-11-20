@@ -287,3 +287,90 @@ func TestDB_SyncAndWaitFinishesACheckpointItsCallerAbandons(t *testing.T) {
 		t.Fatalf("last ltx %+v, want the copy of the restarted wal the abandoned checkpoint began", hdr)
 	}
 }
+
+func TestDB_WritesQueuedBehindAPassiveCheckpointKeepTheNextSyncIncremental(t *testing.T) {
+	db := openReplicatedDB(t)
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = sqldb.Close() })
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+	walBefore, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshots := db.snapshotStarts()
+
+	const queuedWrites = 64
+	raced := false
+	db.checkpointBarrierReleased = func() {
+		if raced {
+			return
+		}
+		raced = true
+		for id := 3; id < 3+queuedWrites; id++ {
+			if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (?)`, id); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	db.MinCheckpointPageN = 1
+	if err := db.SyncAndWait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	db.checkpointBarrierReleased = nil
+	db.MinCheckpointPageN = DefaultMinCheckpointPageN
+	if !raced {
+		t.Fatal("the sync took no passive checkpoint, so nothing raced it")
+	}
+	walAfter, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(walBefore[16:24], walAfter[16:24]) {
+		t.Fatal("the queued writes did not restart the WAL, so nothing raced the verify")
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-snapshots:
+		t.Fatal("the race took a full snapshot of the database")
+	default:
+	}
+
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	opt := NewRestoreOptions()
+	opt.OutputPath = restored
+	if err := NewReplicaWithClient(nil, db.Replica.Client).Restore(t.Context(), opt); err != nil {
+		t.Fatal(err)
+	}
+	copied, err := sql.Open("sqlite", restored)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copied.Close()
+	var rows, ids int
+	if err := copied.QueryRow(`SELECT count(*), sum(id) FROM t`).Scan(&rows, &ids); err != nil {
+		t.Fatal(err)
+	}
+	last := 2 + queuedWrites
+	if want := last * (last + 1) / 2; rows != last || ids != want {
+		t.Fatalf("restored rows=%d ids=%d, want rows=%d ids=%d", rows, ids, last, want)
+	}
+}
