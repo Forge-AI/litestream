@@ -195,19 +195,20 @@ func TestDB_SyncAndWaitQueuesBehindAnIncrementalHolder(t *testing.T) {
 	}
 }
 
-func syncOverHTTP(t *testing.T, db *DB, timeoutSeconds int) (int, string) {
+func syncOverHTTP(t *testing.T, db *DB, timeoutSeconds int) (int, string, SyncDiagnostic) {
 	t.Helper()
 	server := NewServer(NewStore([]*DB{db}, CompactionLevels{{Level: 0}}))
 	body := fmt.Sprintf(`{"path": %q, "wait": true, "timeout": %d}`, db.Path(), timeoutSeconds)
 	rec := httptest.NewRecorder()
 	server.handleSync(rec, httptest.NewRequest(http.MethodPost, "/sync", strings.NewReader(body)))
 	var resp struct {
-		Error string `json:"error"`
+		Error   string         `json:"error"`
+		Details SyncDiagnostic `json:"details"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatal(err)
 	}
-	return rec.Code, resp.Error
+	return rec.Code, resp.Error, resp.Details
 }
 
 func TestServer_SyncDuringASnapshotAnswersUnavailable(t *testing.T) {
@@ -215,12 +216,28 @@ func TestServer_SyncDuringASnapshotAnswersUnavailable(t *testing.T) {
 	holdExecutor(t, db)
 	startSnapshot(db)
 
-	status, message := syncOverHTTP(t, db, 10)
+	status, message, _ := syncOverHTTP(t, db, 10)
 	if status != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d error=%q, want 503", status, message)
 	}
 	if !strings.Contains(message, ErrSnapshotting.Error()) {
 		t.Fatalf("error=%q, want the snapshot refusal", message)
+	}
+}
+
+func TestServer_SyncTimeoutCarriesTheExecutorHolder(t *testing.T) {
+	db := openReplicatedDB(t)
+	holdExecutor(t, db)
+
+	status, message, details := syncOverHTTP(t, db, 1)
+	if status != http.StatusInternalServerError {
+		t.Fatalf("status=%d error=%q, want 500", status, message)
+	}
+	if !strings.Contains(message, "wait for db sync executor: context deadline exceeded") {
+		t.Fatalf("error=%q, want the executor deadline", message)
+	}
+	if !details.Active || details.Phase != "verify" || details.Snapshotting || details.Path != db.Path() {
+		t.Fatalf("details=%+v, want the active verifying holder of %s", details, db.Path())
 	}
 }
 
