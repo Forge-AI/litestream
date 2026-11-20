@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -80,6 +81,7 @@ type DB struct {
 	syncDiag                  diagState
 	handover                  handoverClaim
 	cuts                      cuts
+	baseDropped               atomic.Bool
 
 	lastLTXPage *verifiedLTXPage
 
@@ -1009,6 +1011,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
 	db.compactor.forgetHolds()
+	db.baseDropped.Store(false)
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {

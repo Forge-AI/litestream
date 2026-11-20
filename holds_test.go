@@ -113,8 +113,8 @@ func TestHold_ABaseRecordAHoldNamesStaysUntilTheGrandchildsBaseIsGone(t *testing
 		t.Fatal(err)
 	}
 
-	if err := compactor.DropBase(ctx); err != nil {
-		t.Fatal(err)
+	if dropped, err := compactor.DropBase(ctx); err != nil || dropped {
+		t.Fatalf("a held base record reported dropped %v: %v", dropped, err)
 	}
 	if _, err := os.Stat(ownBase); err != nil {
 		t.Fatalf("a held base record was dropped: %v", err)
@@ -123,11 +123,33 @@ func TestHold_ABaseRecordAHoldNamesStaysUntilTheGrandchildsBaseIsGone(t *testing
 	if err := os.Remove(grandchildBase); err != nil {
 		t.Fatal(err)
 	}
-	if err := compactor.DropBase(ctx); err != nil {
-		t.Fatal(err)
+	if dropped, err := compactor.DropBase(ctx); err != nil || !dropped {
+		t.Fatalf("an unheld base record reported dropped %v: %v", dropped, err)
 	}
 	if _, err := os.Stat(ownBase); !os.IsNotExist(err) {
 		t.Fatalf("the base record outlived its last hold: %v", err)
+	}
+}
+
+func TestStore_ADatabaseDropsItsBaseRecordOncePerOpen(t *testing.T) {
+	ctx := context.Background()
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	client := db.Replica.Client.(*file.ReplicaClient)
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now())
+	base := client.ObjectKey(litestream.BaseName)
+
+	for pass, want := range []bool{false, true, true} {
+		if err := client.WriteHead(ctx, base, []byte(`{}`)); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.EnforceSnapshotRetention(ctx, db); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(base); (err == nil) != want {
+			t.Fatalf("pass %d: base record present %v, want %v: %v", pass, err == nil, want, err)
+		}
 	}
 }
 
