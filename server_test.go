@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -443,6 +445,49 @@ func TestServer_HandleRegister(t *testing.T) {
 		var result litestream.RegisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		require.Equal(t, "already_registered", result.Status)
+	})
+
+	t.Run("ConcurrentRegistersRegisterOnce", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"}`, db.Path(), t.TempDir())
+
+		statuses := make([]string, 8)
+		var wg sync.WaitGroup
+		for i := range statuses {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				client := newSocketClient(t, server.SocketPath)
+				resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+				if err != nil {
+					statuses[i] = err.Error()
+					return
+				}
+				defer resp.Body.Close()
+				var result litestream.RegisterDatabaseResponse
+				if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+					statuses[i] = err.Error()
+					return
+				}
+				statuses[i] = fmt.Sprintf("%d %s", resp.StatusCode, result.Status)
+			}()
+		}
+		wg.Wait()
+
+		want := append(slices.Repeat([]string{"200 already_registered"}, len(statuses)-1), "200 registered")
+		require.ElementsMatch(t, want, statuses)
+		require.Len(t, store.DBs(), 1)
 	})
 }
 

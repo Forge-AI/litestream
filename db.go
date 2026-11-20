@@ -2083,13 +2083,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	// Write to temp file and atomically rename
 	localPath := db.LTXPath(0, minTXID, maxTXID)
-	tmpPath := localPath + ".tmp"
 
 	db.setSyncDiagPhase(diagPhaseInitReplicaPrepare)
-	tmpFile, err := os.Create(tmpPath)
+	tmpFile, err := os.CreateTemp(filepath.Dir(localPath), filepath.Base(localPath)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp L0 file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
 	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
 
 	db.setSyncDiagPhase(diagPhaseInitReplicaCopy)

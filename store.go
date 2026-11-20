@@ -290,9 +290,11 @@ func (s *Store) DBs() []*DB {
 }
 
 // RegisterDB registers a new database with the store and starts monitoring it.
-func (s *Store) RegisterDB(db *DB) error {
+// It returns the instance the store holds for the path, which is an earlier
+// instance than db when the path was already registered.
+func (s *Store) RegisterDB(db *DB) (*DB, error) {
 	if db == nil {
-		return fmt.Errorf("db required")
+		return nil, fmt.Errorf("db required")
 	}
 
 	// First check: see if database already exists
@@ -300,7 +302,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	for _, existing := range s.dbs {
 		if existing.Path() == db.Path() {
 			s.mu.Unlock()
-			return nil
+			return existing, nil
 		}
 	}
 	s.mu.Unlock()
@@ -320,11 +322,11 @@ func (s *Store) RegisterDB(db *DB) error {
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
 	if err := db.Open(); err != nil {
-		return fmt.Errorf("open db: %w", err)
+		return nil, fmt.Errorf("open db: %w", err)
 	}
 
 	// Second check: verify database wasn't added by another goroutine while we were opening.
-	// If it was, close our instance and return without error.
+	// If it was, close our instance and return the one already held.
 	s.mu.Lock()
 
 	for _, existing := range s.dbs {
@@ -335,7 +337,7 @@ func (s *Store) RegisterDB(db *DB) error {
 			if err := db.Close(context.Background()); err != nil {
 				db.Logger.Error("close duplicate db", "path", db.Path(), "error", err)
 			}
-			return nil
+			return existing, nil
 		}
 	}
 
@@ -346,7 +348,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	// Start heartbeat monitor if heartbeat is configured and monitor isn't running.
 	s.startHeartbeatMonitorIfNeeded()
 
-	return nil
+	return db, nil
 }
 
 // UnregisterDB stops monitoring the database at the provided path and closes it.

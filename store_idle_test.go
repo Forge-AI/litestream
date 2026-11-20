@@ -402,7 +402,7 @@ func registerCounted(t *testing.T, store *Store, dir, name string) *countedDB {
 	db.RetentionEnabled = false
 	db.Replica = NewReplica(db)
 	db.Replica.Client = client
-	if err := store.RegisterDB(db); err != nil {
+	if _, err := store.RegisterDB(db); err != nil {
 		t.Fatal(err)
 	}
 	app, err := sql.Open("sqlite", path)
