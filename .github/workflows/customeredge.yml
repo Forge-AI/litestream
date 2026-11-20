@@ -1,0 +1,16 @@
+name: customeredge
+
+on:
+  pull_request:
+  push:
+    branches: [ssql-litestream]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -count=1 ./internal/customeredge

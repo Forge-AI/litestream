@@ -40,7 +40,7 @@ jobs:
             echo "rebased=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
       - if: steps.rebase.outputs.current != 'true'
-        run: go vet ./... && go test -count=1 . ./internal ./abs ./file ./gs ./nats ./s3 ./sftp ./cmd/litestream
+        run: go vet ./... && go test -count=1 . ./internal/... ./abs ./file ./gs ./nats ./s3 ./sftp ./cmd/litestream
       - if: steps.rebase.outputs.current != 'true'
         env:
           UPSTREAM: ${{ steps.rebase.outputs.upstream }}
