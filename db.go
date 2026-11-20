@@ -67,22 +67,23 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	opened    bool          // true if Open() was called and Close() not yet called
-	openedAt  time.Time
-	syncState syncState
-	syncDiag  diagState
-	moved     atomic.Int64
-	handover  handoverClaim
+	mu          sync.RWMutex
+	execSem     *semaphore.Weighted
+	path        string        // part to database
+	metaPath    string        // Path to the database metadata.
+	db          *sql.DB       // target database
+	f           *os.File      // long-running db file descriptor
+	rtx         *sql.Tx       // long running read transaction
+	pageSize    int           // page size, in bytes
+	notify      chan struct{} // closes on WAL change
+	chkMu       sync.RWMutex  // checkpoint lock
+	opened      bool          // true if Open() was called and Close() not yet called
+	openedAt    time.Time
+	syncState   syncState
+	syncDiag    diagState
+	moved       atomic.Int64
+	handover    handoverClaim
+	baseDropped atomic.Bool
 
 	pendingFullSnapshots sync.Map
 	boundary             sync.Mutex
@@ -1036,6 +1037,8 @@ func (db *DB) Open() (err error) {
 	db.compactor.VerifyCompaction = db.VerifyCompaction
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
+	db.compactor.forgetHolds()
+	db.baseDropped.Store(false)
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 && !db.SyncDriven {
@@ -3751,7 +3754,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	// Remove files marked for deletion from remote storage (unless retention disabled).
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -3887,7 +3890,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
-	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	} else if err := db.compactor.deleteUnheld(ctx, db.Replica.Client, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
