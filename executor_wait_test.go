@@ -381,7 +381,7 @@ func TestDB_WritesQueuedBehindAPassiveCheckpointKeepTheNextSyncIncremental(t *te
 	}
 }
 
-func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
+func holdFullCopyUntilAbandoned(t *testing.T, db *DB, mode string) <-chan error {
 	t.Helper()
 	sqldb, err := sql.Open("sqlite", db.Path())
 	if err != nil {
@@ -391,8 +391,10 @@ func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
 	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (1)`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	if mode == CheckpointModeTruncate {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (2)`); err != nil {
 		t.Fatal(err)
@@ -408,18 +410,18 @@ func holdFullCopyUntilAbandoned(t *testing.T, db *DB) <-chan error {
 		return defaultOpenLTXFile(name, flag, perm)
 	}
 	checkpointed := make(chan error, 1)
-	go func() { checkpointed <- db.Checkpoint(context.Background(), CheckpointModeTruncate) }()
+	go func() { checkpointed <- db.Checkpoint(context.Background(), mode) }()
 	select {
 	case <-copying:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the checkpoint took no boundary copy")
+		t.Fatalf("the %s checkpoint took no full copy", mode)
 	}
 	return checkpointed
 }
 
 func TestDB_AbandonStopsAFullCopyInsideACheckpointAndTheNextProcessLosesNothing(t *testing.T) {
 	db := openUncheckedDB(t)
-	checkpointed := holdFullCopyUntilAbandoned(t, db)
+	checkpointed := holdFullCopyUntilAbandoned(t, db, CheckpointModePassive)
 	_, before, err := db.MaxLTX()
 	if err != nil {
 		t.Fatal(err)
@@ -489,7 +491,7 @@ func TestAbandonAll_ACheckpointInOneDatabaseDoesNotHoldACopyInAnother(t *testing
 		_ = checkpointing.Close(context.Background())
 		_ = copying.Close(context.Background())
 	})
-	checkpointed := holdFullCopyUntilAbandoned(t, copying)
+	checkpointed := holdFullCopyUntilAbandoned(t, copying, CheckpointModeTruncate)
 
 	checkpointing.boundary.Lock()
 	abandoned := make(chan struct{})
