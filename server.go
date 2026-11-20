@@ -769,8 +769,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	db.Replica = replica
 
 	// Register database with store (this also opens the database).
-	if err := s.store.RegisterDB(db); err != nil {
+	held, err := s.store.RegisterDB(db)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
+		return
+	}
+	if held != db {
+		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+			Status: "already_registered",
+			Path:   expandedPath,
+		})
 		return
 	}
 
@@ -851,8 +859,16 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 	replica.HeadKey = req.Head
 	db.Replica = replica
 
-	if err := s.store.RegisterDB(db); err != nil {
+	held, err := s.store.RegisterDB(db)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
+		return
+	}
+	if held != db {
+		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+			Status: "already_registered",
+			Path:   expandedPath,
+		})
 		return
 	}
 

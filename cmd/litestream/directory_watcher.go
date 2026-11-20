@@ -305,7 +305,7 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 		return
 	}
 
-	if err := dm.store.RegisterDB(db); err != nil {
+	if db, err = dm.store.RegisterDB(db); err != nil {
 		dm.logger.Error("register database with store", "path", path, "error", err)
 		return
 	}
