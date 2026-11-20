@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -29,6 +32,7 @@ const ReplicaClientType = "file"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
+var _ litestream.PageMapClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to disk.
 type ReplicaClient struct {
@@ -166,9 +170,69 @@ func (c *ReplicaClient) WriteHead(_ context.Context, key string, text []byte) er
 	return os.Rename(tmp, key)
 }
 
+// WriteHeadIf writes one small object at a full path from r, through a
+// rename, only while the file is at version, a hash of its bytes, or absent
+// when version is empty, and returns the new version. A failed condition
+// returns litestream.ErrHeadMoved.
+func (c *ReplicaClient) WriteHeadIf(_ context.Context, key string, r *io.SectionReader, version string) (string, error) {
+	headWrites.Lock()
+	defer headWrites.Unlock()
+	current, err := os.ReadFile(key)
+	switch {
+	case os.IsNotExist(err):
+		if version != "" {
+			return "", litestream.ErrHeadMoved
+		}
+	case err != nil:
+		return "", err
+	case headVersion(current) != version:
+		return "", litestream.ErrHeadMoved
+	}
+	if err := os.MkdirAll(filepath.Dir(key), 0o755); err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp(filepath.Dir(key), filepath.Base(key)+".*.tmp")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.Remove(f.Name()) }()
+	hash := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, hash), r); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	if err := os.Chmod(f.Name(), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(f.Name(), key); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
 // ReadHead reads one small object at a full path.
 func (c *ReplicaClient) ReadHead(_ context.Context, key string) ([]byte, error) {
 	return os.ReadFile(key)
+}
+
+// ReadHeadVersion reads one small object at a full path and a hash of its
+// bytes as its version.
+func (c *ReplicaClient) ReadHeadVersion(_ context.Context, key string) ([]byte, string, error) {
+	b, err := os.ReadFile(key)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, headVersion(b), nil
+}
+
+var headWrites sync.Mutex
+
+func headVersion(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // ObjectKey returns the full path of a small object of this replica.
