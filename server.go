@@ -479,6 +479,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait, req.Checkpoint)
 	if err != nil {
+		var waitErr *ExecutorWaitError
 		switch {
 		case errors.Is(context.Cause(ctx), ErrStalled):
 			writeJSONError(w, http.StatusGatewayTimeout, err.Error(), nil)
@@ -490,6 +491,8 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 			writeJSONError(w, http.StatusServiceUnavailable, err.Error(), nil)
 		case isRefused(err):
 			writeJSONError(w, http.StatusForbidden, err.Error(), nil)
+		case errors.As(err, &waitErr):
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), waitErr.Holder)
 		default:
 			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		}
