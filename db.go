@@ -142,6 +142,11 @@ type DB struct {
 	// page size). Set to 0 to retain the default emergency threshold.
 	TruncatePageN int
 
+	// If true, the database runs no loop of its own: it syncs only when its
+	// caller calls Sync, and checkpoints PASSIVE after each sync that copied
+	// new frames in place of the threshold, interval and TRUNCATE checkpoints.
+	SyncDriven bool
+
 	// Time between automatic checkpoints in the WAL. This is done to allow
 	// more fine-grained WAL files so that restores can be performed with
 	// better precision.
@@ -964,7 +969,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.client = db.Replica.Client
 
 	// Start monitoring SQLite database in a separate goroutine.
-	if db.MonitorInterval > 0 {
+	if db.MonitorInterval > 0 && !db.SyncDriven {
 		db.wg.Add(1)
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
@@ -1311,7 +1316,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 
 	// Start replication.
-	if db.Replica != nil {
+	if db.Replica != nil && !db.SyncDriven {
 		db.Replica.Start(db.ctx)
 	}
 
@@ -1652,6 +1657,15 @@ func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool,
 // updates from previous checkpoints). See issue #896.
 func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWALSize, newWALSize int64) error {
 	if db.pageSize == 0 {
+		return nil
+	}
+	if db.SyncDriven {
+		if !exec.state.syncedSinceCheckpoint {
+			return nil
+		}
+		if _, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil && !isSQLiteBusyError(err) {
+			return err
+		}
 		return nil
 	}
 	if !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
