@@ -1060,7 +1060,11 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	// Ensure replicas perform a final sync and stop replicating.
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
+			if e := db.syncReplicaWithRetry(ctx); e == nil {
+				if e := db.Replica.restHeld(ctx); e != nil && err == nil {
+					err = e
+				}
+			} else if err == nil {
 				err = e
 			}
 		}
