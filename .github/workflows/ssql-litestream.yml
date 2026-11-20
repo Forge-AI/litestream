@@ -7,12 +7,11 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   rebase:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.FORGE_REBASE_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,11 +27,11 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch -q https://github.com/benbjohnson/litestream.git main
           upstream=$(git rev-parse FETCH_HEAD)
-          replaced=$(git rev-parse HEAD)
           if git merge-base --is-ancestor "$upstream" HEAD; then
             echo "current=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          replaced=$(git rev-parse HEAD)
           git rebase "$upstream"
           {
             echo "upstream=$upstream"
@@ -40,61 +39,19 @@ jobs:
             echo "rebased=$(git rev-parse HEAD)"
           } >> "$GITHUB_OUTPUT"
       - if: steps.rebase.outputs.current != 'true'
-        run: go vet ./... && go test -count=1 . ./internal ./abs ./file ./gs ./nats ./s3 ./sftp ./cmd/litestream
+        run: go vet ./... && go test -count=1 . ./internal/... ./abs ./file ./gs ./nats ./s3 ./sftp ./cmd/litestream
       - if: steps.rebase.outputs.current != 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           UPSTREAM: ${{ steps.rebase.outputs.upstream }}
           REPLACED: ${{ steps.rebase.outputs.replaced }}
           REBASED: ${{ steps.rebase.outputs.rebased }}
         run: |
-          tag="forge/ssql-litestream/$(date -u +%Y%m%d)-${REPLACED:0:12}"
-          git tag "$tag" "$REPLACED"
-          git push origin "refs/tags/$tag"
-          git push --force-with-lease="ssql-litestream:$REPLACED" origin "$REBASED:refs/heads/ssql-litestream"
-
-          monorepo=repos/Forge-AI/monorepo
-          script=go/litestream-next/build.sh
-          branch="litestream-next-lock/${REBASED:0:12}"
-          title="sandsql: ⬆️ litestream-next locks ssql-litestream at ${REBASED:0:12}, rebased onto upstream main ${UPSTREAM:0:12}"
-          gh api "$monorepo/git/refs" -f ref="refs/heads/$branch" -f sha="$(gh api "$monorepo/git/ref/heads/dev" --jq .object.sha)" > /dev/null
-          gh api "$monorepo/contents/$script?ref=$branch" > current.json
-          jq -r .content current.json | base64 -d | sed "s/^COMMIT=\"[0-9a-f]*\"$/COMMIT=\"$REBASED\"/" > build.sh
-          gh api -X PUT "$monorepo/contents/$script" -f message="$title" -f branch="$branch" \
-            -f sha="$(jq -r .sha current.json)" -f content="$(base64 -w0 build.sh)" > /dev/null
-          gh pr create --repo Forge-AI/monorepo --base dev --head "$branch" --title "$title" --body "## Context
-
-          The nightly rebase of Forge-AI/litestream's \`ssql-litestream\` onto upstream main moved the branch from \`$REPLACED\` to \`$REBASED\`, and tagged the replaced tip \`$tag\`, so every build that locks it keeps building.
-
-          ## Summary
-
-          \`go/litestream-next/build.sh\` locks the rebased tip.
-
-          ## Show me
-
-          \`\`\`sh
-          COMMIT=\"$REBASED\"
-          \`\`\`
-
-          Upstream's own unit suite passed on the rebased tree in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID before the push.
-
-          ## Motivation
-
-          The owner's rule (Nov 19): a lock is on its branch or a \`forge/<branch>/<date>\` tag, and dev's \`litestream-locks\` step stays red until the branch tip is locked.
-
-          ## Risk profile
-
-          - **Threat model:** none new.
-          - **Availability:** this changes the litestream-next binary journal-next, cloudrunner and runtime-api ship.
-          - **Data:** SandSQL replication. Dangerous by AGENTS.md; merge only on the owner's Approve.
-
-          ## New patterns
-
-          None.
-
-          ## Design
-
-          - Rebased by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
-
-          ## Changes
-
-          - \`go/litestream-next/build.sh\`: \`COMMIT\` moves to \`$REBASED\`."
+          branch="rebase/$(date -u +%Y%m%d)-${UPSTREAM:0:12}"
+          # A pull request opened with github.token starts no checks, so the branch starts at upstream main and
+          # FORGE_REBASE_TOKEN's fast-forward push to the rebased tip is the event that runs them.
+          git push origin "$UPSTREAM:refs/heads/$branch"
+          gh pr create --base ssql-litestream --head "$branch" \
+            --title "sandsql: ⬆️ rebase ssql-litestream onto upstream main ${UPSTREAM:0:12}" \
+            --body "The nightly rebased \`ssql-litestream\` (\`$REPLACED\`) onto upstream main \`$UPSTREAM\`, giving \`$REBASED\`, and the line's tests passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. Land it by moving \`ssql-litestream\` to \`$REBASED\` once this pull request's checks pass; do not merge it."
+          git push origin "$REBASED:refs/heads/$branch"
