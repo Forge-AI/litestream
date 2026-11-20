@@ -68,7 +68,7 @@ func TestServer_IdleRegisteredDatabasesDoNoWork(t *testing.T) {
 	})
 }
 
-func TestServer_ARegisteredDatabaseCheckpointsOnlyAfterASyncThatCopiedFrames(t *testing.T) {
+func TestServer_ARegisteredDatabaseCheckpointsOnceASyncLeavesItsWALPastTheThreshold(t *testing.T) {
 	server := NewServer(NewStore(nil, CompactionLevels{{Level: 0}}))
 	db := registerSynced(t, server, t.TempDir(), 0)
 	t.Cleanup(func() { _ = db.Close(context.Background()) })
@@ -77,22 +77,31 @@ func TestServer_ARegisteredDatabaseCheckpointsOnlyAfterASyncThatCopiedFrames(t *
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = app.Close() })
-	if _, err := app.Exec(`INSERT INTO t VALUES (1)`); err != nil {
-		t.Fatal(err)
+	synced := func(row int) work {
+		t.Helper()
+		if _, err := app.Exec(`INSERT INTO t VALUES (?)`, row); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
+			t.Fatal(err)
+		}
+		return idleWork([]*DB{db})
 	}
 	before := idleWork([]*DB{db})
+	under := synced(1)
+	if under.passive != before.passive || under.truncate != before.truncate {
+		t.Fatalf("a write synced under the WAL threshold went from %+v to %+v, want no checkpoint", before, under)
+	}
+	db.MinCheckpointPageN = 1
+	past := synced(2)
+	if past.passive != under.passive+1 || past.truncate != under.truncate {
+		t.Fatalf("a write synced past the WAL threshold went from %+v to %+v, want one PASSIVE checkpoint and no TRUNCATE", under, past)
+	}
 	if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
 		t.Fatal(err)
 	}
-	woken := idleWork([]*DB{db})
-	if woken.passive == before.passive || woken.truncate != before.truncate {
-		t.Fatalf("a woken sync went from %+v to %+v, want one PASSIVE checkpoint and no TRUNCATE", before, woken)
-	}
-	if _, err := server.store.SyncDB(context.Background(), db.Path(), true, false); err != nil {
-		t.Fatal(err)
-	}
-	if idle := idleWork([]*DB{db}); idle.passive != woken.passive || idle.truncate != woken.truncate {
-		t.Fatalf("a sync with nothing new went from %+v to %+v, want no checkpoint", woken, idle)
+	if idle := idleWork([]*DB{db}); idle.passive != past.passive || idle.truncate != past.truncate {
+		t.Fatalf("a sync with nothing new went from %+v to %+v, want no checkpoint", past, idle)
 	}
 }
 
