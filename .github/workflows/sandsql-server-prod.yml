@@ -25,13 +25,13 @@ jobs:
             fi
             twins=$(git log -1 --format='%(trailers:key=Next,valueonly)' "$commit" | tr -d '#')
             if [ -z "$twins" ]; then
-              echo "::error::$(git log -1 --format='%h %s' "$commit") has no Next: #<pr> trailer naming its twin merged into ssql-litestream"
+              echo "::error::$(git log -1 --format='%h %s' "$commit") has no Next: #<pr> trailer naming its twin landed on ssql-litestream"
               status=1
             fi
             for twin in $twins; do
-              landed=$(gh pr view "$twin" --repo "$GITHUB_REPOSITORY" --json state,baseRefName --jq '.state + " " + .baseRefName')
-              if [ "$landed" != "MERGED ssql-litestream" ]; then
-                echo "::error::$(git log -1 --format='%h %s' "$commit") names Next: #$twin, which is $landed, not merged into ssql-litestream"
+              read -r state base head <<< "$(gh pr view "$twin" --repo "$GITHUB_REPOSITORY" --json state,baseRefName,headRefOid --jq '.state + " " + .baseRefName + " " + .headRefOid')"
+              if [ "$state $base" != "MERGED ssql-litestream" ] && ! git merge-base --is-ancestor "$head" origin/ssql-litestream 2>/dev/null; then
+                echo "::error::$(git log -1 --format='%h %s' "$commit") names Next: #$twin, which is $state into $base with its head $head not on ssql-litestream"
                 status=1
               fi
             done
