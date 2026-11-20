@@ -1,0 +1,2 @@
+[landing]
+bases = ["sandsql-server-prod"]
