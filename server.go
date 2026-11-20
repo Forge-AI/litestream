@@ -578,6 +578,7 @@ type RegisterDatabaseRequest struct {
 	HandoverWAL       WALEnd `json:"handover_wal"`
 	MonitorIntervalMS int64  `json:"monitor_interval_ms,omitempty"`
 	SyncIntervalMS    int64  `json:"sync_interval_ms,omitempty"`
+	TruncatePageN     int    `json:"truncate_page_n,omitempty"`
 }
 
 // RegisterDrivenRequest is the request body for the /register-driven endpoint.
@@ -585,13 +586,14 @@ type RegisterDatabaseRequest struct {
 // only when /sync wakes it, and its registration replaces a stopped one.
 // Retention, when set, is the database's own and only narrows the store's.
 type RegisterDrivenRequest struct {
-	Path         string `json:"path"`
-	ReplicaURL   string `json:"replica_url"`
-	Head         string `json:"head,omitempty"`
-	HandoverTXID uint64 `json:"handover_txid,omitempty"`
-	HandoverWAL  WALEnd `json:"handover_wal"`
-	Retention    *bool  `json:"retention,omitempty"`
-	AutoRecover  bool   `json:"auto_recover,omitempty"`
+	Path          string `json:"path"`
+	ReplicaURL    string `json:"replica_url"`
+	Head          string `json:"head,omitempty"`
+	HandoverTXID  uint64 `json:"handover_txid,omitempty"`
+	HandoverWAL   WALEnd `json:"handover_wal"`
+	Retention     *bool  `json:"retention,omitempty"`
+	AutoRecover   bool   `json:"auto_recover,omitempty"`
+	TruncatePageN int    `json:"truncate_page_n,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -655,6 +657,9 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create new database.
 	db := NewDB(expandedPath)
+	if req.TruncatePageN != 0 {
+		db.TruncatePageN = req.TruncatePageN
+	}
 	if req.HandoverTXID != 0 {
 		db.SetHandover(Handover{TXID: ltx.TXID(req.HandoverTXID), WAL: req.HandoverWAL})
 	}
@@ -738,6 +743,9 @@ func (s *Server) handleRegisterDriven(w http.ResponseWriter, r *http.Request) {
 	}
 
 	db := NewDB(expandedPath)
+	if req.TruncatePageN != 0 {
+		db.TruncatePageN = req.TruncatePageN
+	}
 	db.SyncDriven = true
 	if req.Retention != nil {
 		db.RetentionEnabled = *req.Retention
