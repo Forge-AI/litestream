@@ -52,6 +52,7 @@ type ReplicaClient struct {
 	AccountName string
 	AccountKey  string
 	SASToken    string // SAS token for container-level access
+	Credentials litestream.CredentialSource
 	Endpoint    string
 
 	// Azure Blob Storage container information
@@ -84,6 +85,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client.Bucket = host
 	client.Path = urlPath
 	client.Endpoint = query.Get("endpoint")
+	client.Credentials = litestream.CredentialSourceFromQuery(query)
 
 	if client.Bucket == "" {
 		return nil, fmt.Errorf("bucket required for abs replica URL")
@@ -158,7 +160,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Create Azure Blob Storage client with appropriate authentication
 	// Priority: SAS token > Shared key > Default credential chain
 	var client *azblob.Client
-	if sasToken != "" {
+	if c.Credentials.URL != "" {
+		clientOptions.PerCallPolicies = append(clientOptions.PerCallPolicies, &sasPolicy{source: c.Credentials})
+		client, err = azblob.NewClientWithNoCredential(endpoint, clientOptions)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create azure blob client for the database's SAS: %w", err)
+		}
+	} else if sasToken != "" {
 		// SAS token authentication - append token to endpoint URL
 		if accountKey != "" {
 			slog.Warn("both SAS token and account key configured, using SAS token")
@@ -496,4 +504,43 @@ func isNotExists(err error) bool {
 		return respErr.ErrorCode == string(bloberror.BlobNotFound) || respErr.ErrorCode == string(bloberror.ContainerNotFound)
 	}
 	return false
+}
+
+type sasPolicy struct {
+	source litestream.CredentialSource
+	mu     sync.Mutex
+	token  string
+	until  time.Time
+}
+
+func (p *sasPolicy) Do(req *policy.Request) (*http.Response, error) {
+	token, err := p.current(req.Raw().Context())
+	if err != nil {
+		return nil, err
+	}
+	raw := req.Raw()
+	if raw.URL.RawQuery == "" {
+		raw.URL.RawQuery = token
+	} else {
+		raw.URL.RawQuery += "&" + token
+	}
+	return req.Next()
+}
+
+func (p *sasPolicy) current(ctx context.Context) (string, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Now().Before(p.until) {
+		return p.token, nil
+	}
+	var sas struct {
+		SASToken  string `json:"sas_token"`
+		ExpiresIn int64  `json:"expires_in"`
+	}
+	if err := p.source.Fetch(ctx, &sas); err != nil {
+		return "", err
+	}
+	p.token = strings.TrimPrefix(sas.SASToken, "?")
+	p.until = time.Now().Add(time.Duration(sas.ExpiresIn) * time.Second)
+	return p.token, nil
 }
