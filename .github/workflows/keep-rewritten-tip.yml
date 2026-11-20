@@ -1,0 +1,20 @@
+name: keep-rewritten-tip
+
+on:
+  push:
+    branches: [ssql-litestream]
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    if: github.event.forced
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          tag="forge/ssql-litestream/$(date -u +%Y%m%d)-${BEFORE:0:12}"
+          gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag" --silent 2>/dev/null || gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$BEFORE"
