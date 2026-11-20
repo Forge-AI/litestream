@@ -131,6 +131,10 @@ type Store struct {
 	// If true, verify TXID consistency at destination level after each compaction.
 	VerifyCompaction bool
 
+	// FaultSocket is the unix socket every managed database faults a lazy
+	// copy's absent segments through before it reads the file raw.
+	FaultSocket string
+
 	// RetentionEnabled controls whether Litestream actively deletes old files
 	// during retention enforcement. When false, cloud provider lifecycle
 	// policies handle retention instead. Local file cleanup still occurs.
@@ -309,6 +313,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
+	db.FaultSocket = s.FaultSocket
 	db.RetentionEnabled = s.RetentionEnabled && db.RetentionEnabled
 	db.Done = s.done
 
@@ -688,6 +693,17 @@ func (s *Store) SetVerifyCompaction(v bool) {
 	for _, db := range s.dbs {
 		db.VerifyCompaction = v
 		db.compactor.VerifyCompaction = v
+	}
+}
+
+// SetFaultSocket updates the fault socket and propagates it to all managed
+// databases.
+func (s *Store) SetFaultSocket(socket string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.FaultSocket = socket
+	for _, db := range s.dbs {
+		db.FaultSocket = socket
 	}
 }
 
