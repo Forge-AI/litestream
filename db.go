@@ -1988,13 +1988,13 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	// Write to temp file and atomically rename
 	localPath := db.LTXPath(0, minTXID, maxTXID)
-	tmpPath := localPath + ".tmp"
 
 	db.setSyncDiagPhase(diagPhaseInitReplicaPrepare)
-	tmpFile, err := os.Create(tmpPath)
+	tmpFile, err := os.CreateTemp(filepath.Dir(localPath), filepath.Base(localPath)+".*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp L0 file: %w", err)
 	}
+	tmpPath := tmpFile.Name()
 	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
 
 	db.setSyncDiagPhase(diagPhaseInitReplicaCopy)
@@ -2089,32 +2089,31 @@ func (db *DB) seedStoreHead(ctx context.Context, claimed, restorable ltx.TXID) (
 		return head.MaxTXID, storeHandoverError, fmt.Errorf("create L0 directory: %w", err)
 	}
 	localPath := db.LTXPath(0, head.MinTXID, head.MaxTXID)
-	tmpPath := localPath + ".tmp"
-	defer func() { _ = os.Remove(tmpPath) }()
-	positioned, err := db.copyStoreHead(ctx, head, tmpPath)
+	f, err := os.CreateTemp(filepath.Dir(localPath), filepath.Base(localPath)+".*.tmp")
+	if err != nil {
+		return head.MaxTXID, storeHandoverError, fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = os.Remove(f.Name()) }()
+	positioned, err := db.copyStoreHead(ctx, head, f)
 	if err != nil {
 		return head.MaxTXID, storeHandoverError, err
 	}
 	if !positioned {
 		return head.MaxTXID, "no_wal_position", nil
 	}
-	if err := os.Rename(tmpPath, localPath); err != nil {
+	if err := os.Rename(f.Name(), localPath); err != nil {
 		return head.MaxTXID, storeHandoverError, fmt.Errorf("rename L0 file: %w", err)
 	}
 	return head.MaxTXID, storeHandoverContinued, nil
 }
 
-func (db *DB) copyStoreHead(ctx context.Context, head ltx.FileInfo, tmpPath string) (bool, error) {
+func (db *DB) copyStoreHead(ctx context.Context, head ltx.FileInfo, f *os.File) (bool, error) {
+	defer func() { _ = f.Close() }()
 	remote, err := db.Replica.Client.OpenLTXFile(ctx, 0, head.MinTXID, head.MaxTXID, 0, 0)
 	if err != nil {
 		return false, fmt.Errorf("open the store's L0 head: %w", err)
 	}
 	defer func() { _ = remote.Close() }()
-	f, err := os.Create(tmpPath)
-	if err != nil {
-		return false, fmt.Errorf("create temp L0 file: %w", err)
-	}
-	defer func() { _ = f.Close() }()
 	if _, err := io.Copy(f, remote); err != nil {
 		return false, fmt.Errorf("copy the store's L0 head: %w", err)
 	}
