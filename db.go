@@ -87,6 +87,7 @@ type DB struct {
 	abandon              context.CancelFunc
 
 	lastLTXPage               *verifiedLTXPage
+	checkpointBarrierTaken    func()
 	checkpointBarrierReleased func()
 
 	// last file info for each level
@@ -334,6 +335,7 @@ type syncExecutor struct {
 	l0FileInfo          *ltx.FileInfo
 	synced              bool
 	checkpointAttempted bool
+	barrier             *sql.Tx
 }
 
 type diagOp string
@@ -2231,6 +2233,11 @@ func (db *DB) verifyWAL(ctx context.Context, exec *syncExecutor) (info syncInfo,
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
 	info.prevCommit = dec.Header().Commit
+	if info.offset < WALHeaderSize {
+		info.offset = WALHeaderSize
+		info.reason = "last ltx file holds no wal position, snapshotting"
+		return info, nil
+	}
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -2604,6 +2611,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, err error) {
+	assert(!info.snapshotting || exec.barrier == nil, "a full snapshot never runs under the checkpoint barrier")
 	if info.snapshotting {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithCancel(ctx)
@@ -3161,24 +3169,32 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	exec.applySyncResult(result)
 
-	var barrierTx *sql.Tx
 	if mode == CheckpointModePassive {
-		barrierTx, err = db.db.BeginTx(ctx, nil)
-		if err != nil {
+		if exec.barrier, err = db.db.BeginTx(ctx, nil); err != nil {
 			return false, fmt.Errorf("begin passive checkpoint barrier: %w", err)
 		}
 		defer func() {
-			if barrierTx != nil {
-				_ = rollback(barrierTx)
+			if exec.barrier != nil {
+				_ = rollback(exec.barrier)
+				exec.barrier = nil
 			}
 		}()
-
-		if _, err := barrierTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+		if _, err := exec.barrier.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
 			return false, fmt.Errorf("_litestream_lock: %w", err)
 		}
+		if db.checkpointBarrierTaken != nil {
+			db.checkpointBarrierTaken()
+		}
 
-		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		info, err := db.verifyWithExecutor(ctx, exec)
 		if err != nil {
+			return false, fmt.Errorf("cannot verify wal before passive checkpoint: %w", err)
+		}
+		if info.snapshotting {
+			db.Logger.Info("passive checkpoint skipped, the wal needs a full snapshot first", "reason", info.reason)
+			return false, nil
+		}
+		if result, err = db.sync(ctx, true, exec, info, 0); err != nil {
 			return false, fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
 		}
 		exec.applySyncResult(result)
@@ -3202,11 +3218,12 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		return false, err
 	}
 
-	if barrierTx != nil {
-		if err = rollback(barrierTx); err != nil {
+	if exec.barrier != nil {
+		err = rollback(exec.barrier)
+		exec.barrier = nil
+		if err != nil {
 			return false, fmt.Errorf("rollback passive checkpoint barrier: %w", err)
 		}
-		barrierTx = nil
 	}
 	if db.checkpointBarrierReleased != nil {
 		db.checkpointBarrierReleased()

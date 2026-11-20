@@ -5481,3 +5481,10 @@ func writeLTXFile(t *testing.T, b []byte) *os.File {
 	t.Cleanup(func() { _ = f.Close() })
 	return f
 }
+
+func TestDB_NegativeTruncatePageNNeverExceedsThreshold(t *testing.T) {
+	db := &DB{pageSize: 4096, TruncatePageN: -1}
+	if db.exceedsTruncateThreshold(calcWALSize(4096, 2*DefaultTruncatePageN)) {
+		t.Fatal("negative TruncatePageN must disable truncate checkpoints")
+	}
+}
