@@ -159,6 +159,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Create Azure Blob Storage client with appropriate authentication
 	// Priority: SAS token > Shared key > Default credential chain
+	clientOptions.Transport = &http.Client{Transport: litestream.Transport}
 	var client *azblob.Client
 	if c.Credentials.URL != "" {
 		clientOptions.PerCallPolicies = append(clientOptions.PerCallPolicies, &sasPolicy{source: c.Credentials})
