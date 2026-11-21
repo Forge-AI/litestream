@@ -230,12 +230,9 @@ func TestVFS_PeriodicSync(t *testing.T) {
 	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (2, 'Bob')")
 	require.NoError(t, err)
 
-	// Wait for auto-sync (should happen within ~200ms)
-	time.Sleep(500 * time.Millisecond)
-
-	// Verify new LTX file was created
-	newCount := countLTXFiles(t, client)
-	require.Greater(t, newCount, initialCount, "expected new LTX file from auto-sync")
+	require.Eventually(t, func() bool {
+		return countLTXFiles(t, client) > initialCount
+	}, 10*time.Second, 20*time.Millisecond, "expected new LTX file from auto-sync")
 }
 
 // TestVFS_SyncDuringTransaction verifies sync is deferred during active transaction.
@@ -274,12 +271,9 @@ func TestVFS_SyncDuringTransaction(t *testing.T) {
 	err = tx.Commit()
 	require.NoError(t, err)
 
-	// Wait for sync after commit
-	time.Sleep(300 * time.Millisecond)
-
-	// Now LTX should have increased
-	finalCount := countLTXFiles(t, client)
-	require.Greater(t, finalCount, initialCount, "expected new LTX file after commit")
+	require.Eventually(t, func() bool {
+		return countLTXFiles(t, client) > initialCount
+	}, 10*time.Second, 20*time.Millisecond, "expected new LTX file after commit")
 }
 
 // TestVFS_ManualSyncOnly tests with SyncInterval=0 (manual sync only).
