@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -113,6 +114,7 @@ type Store struct {
 
 	owed      map[int]map[*DB]struct{}
 	compacted map[int]map[*DB]time.Time
+	wakes     map[int]chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -124,8 +126,9 @@ type Store struct {
 	// How often to check for expired L0 files.
 	L0RetentionCheckInterval time.Duration
 
-	// If true, each replica sync pays the compactions, snapshot and retention
-	// its database owes once their level is due.
+	// If true, the store runs one goroutine per compaction level, and each
+	// replica sync wakes the levels its database owes. A sync answers before
+	// any compaction, snapshot or retention it owes runs.
 	CompactionMonitorEnabled bool
 
 	// If true, verify TXID consistency at destination level after each compaction.
@@ -177,15 +180,19 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
 		owed:                     map[int]map[*DB]struct{}{SnapshotLevel: {}},
 		compacted:                map[int]map[*DB]time.Time{SnapshotLevel: {}},
+		wakes:                    map[int]chan struct{}{SnapshotLevel: make(chan struct{}, 1)},
 	}
 	for _, lvl := range levels {
 		s.owed[lvl.Level] = map[*DB]struct{}{}
 		s.compacted[lvl.Level] = map[*DB]time.Time{}
+		if lvl.Level != 0 {
+			s.wakes[lvl.Level] = make(chan struct{}, 1)
+		}
 	}
 
 	for _, db := range dbs {
 		db.owe = s.ower(db)
-		db.pay = func(ctx context.Context) { s.pay(ctx, db) }
+		db.pay = func() { s.pay(db) }
 		db.registered = true
 		db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 		db.L0Retention = s.L0Retention
@@ -243,6 +250,16 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
+	if s.CompactionMonitorEnabled {
+		for _, lvl := range append(slices.Clone(s.levels[1:]), s.SnapshotLevel()) {
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				s.payLevelOwed(s.ctx, lvl)
+			}()
+		}
+	}
+
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
 
@@ -259,8 +276,9 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	// Stop the store's monitors before closing the databases. Each database's
-	// Close cancels the compactions, snapshots and retention its syncs pay.
+	// Stop the store's monitors and compaction goroutines before closing the
+	// databases. Each database's Close cancels the compaction, snapshot or
+	// retention running for it.
 	s.cancel()
 	s.wg.Wait()
 
@@ -309,7 +327,7 @@ func (s *Store) RegisterDB(db *DB) (*DB, error) {
 
 	// Apply store-wide settings before opening the database.
 	db.owe = s.ower(db)
-	db.pay = func(ctx context.Context) { s.pay(ctx, db) }
+	db.pay = func() { s.pay(db) }
 	db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
@@ -403,35 +421,47 @@ func (s *Store) owe(db *DB, level int) {
 	}
 }
 
-func (s *Store) takeOwed(db *DB) CompactionLevels {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var owed CompactionLevels
-	for _, lvl := range append(slices.Clone(s.levels), s.SnapshotLevel()) {
-		if _, ok := s.owed[lvl.Level][db]; ok {
-			delete(s.owed[lvl.Level], db)
-			owed = append(owed, lvl)
-		}
-	}
-	return owed
-}
-
-func (s *Store) pay(ctx context.Context, db *DB) {
+func (s *Store) pay(db *DB) {
 	if !s.CompactionMonitorEnabled {
 		return
 	}
-	db.paying.Lock()
-	defer db.paying.Unlock()
-	var kept CompactionLevels
-	for owed := s.takeOwed(db); len(owed) > 0; owed = s.takeOwed(db) {
-		for _, lvl := range owed {
-			if s.payLevel(ctx, db, lvl) {
-				kept = append(kept, lvl)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for level, wake := range s.wakes {
+		if _, ok := s.owed[level][db]; ok {
+			select {
+			case wake <- struct{}{}:
+			default:
 			}
 		}
 	}
-	for _, lvl := range kept {
-		s.owe(db, lvl.Level)
+}
+
+func (s *Store) payLevelOwed(ctx context.Context, lvl *CompactionLevel) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.wakes[lvl.Level]:
+		}
+		s.mu.Lock()
+		owed := slices.Collect(maps.Keys(s.owed[lvl.Level]))
+		clear(s.owed[lvl.Level])
+		s.mu.Unlock()
+		for _, db := range owed {
+			db.mu.Lock()
+			life := db.ctx
+			db.mu.Unlock()
+			levelCtx, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(life, cancel)
+			if s.payLevel(levelCtx, db, lvl) {
+				s.owe(db, lvl.Level)
+			} else {
+				s.pay(db)
+			}
+			stop()
+			cancel()
+		}
 	}
 }
 

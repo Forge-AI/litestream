@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -174,13 +175,15 @@ func TestStore_ALevelCompactsOncePerIntervalAndPaysWhatItOwesAfterTheBoundary(t 
 		time.Sleep(58 * time.Second)
 		db.write(t, store, 1)
 		time.Sleep(2 * time.Second)
-		store.pay(ctx, registered)
+		store.pay(registered)
+		synctest.Wait()
 		if got := len(uploadedFiles(t, db, 1)); got != 1 {
 			t.Fatalf("the first pay after the boundary left %d level-one files, want 1", got)
 		}
 
 		time.Sleep(time.Second)
 		db.write(t, store, 2)
+		synctest.Wait()
 		if got := len(uploadedFiles(t, db, 1)); got != 1 {
 			t.Errorf("a write in the interval level one already compacted in left %d level-one files, want 1: the level compacts once per interval", got)
 		}
@@ -189,7 +192,8 @@ func TestStore_ALevelCompactsOncePerIntervalAndPaysWhatItOwesAfterTheBoundary(t 
 		}
 
 		time.Sleep(time.Minute)
-		store.pay(ctx, registered)
+		store.pay(registered)
+		synctest.Wait()
 		if got := len(uploadedFiles(t, db, 1)); got != 2 {
 			t.Errorf("the first pay after the next boundary left %d level-one files, want 2", got)
 		}
@@ -201,6 +205,132 @@ func TestStore_ALevelCompactsOncePerIntervalAndPaysWhatItOwesAfterTheBoundary(t 
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStore_ASyncAnswersBeforeTheCompactionItOwesAtAnyDatabaseSize(t *testing.T) {
+	for _, rows := range []int{1, 4096} {
+		for _, level := range []int{1, SnapshotLevel} {
+			t.Run(fmt.Sprintf("%d rows, level %d held", rows, level), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) { syncPastAHeldLevel(t, rows, level) })
+			})
+		}
+	}
+}
+
+func syncPastAHeldLevel(t *testing.T, rows, level int) {
+	ctx := context.Background()
+	store := NewStore(nil, CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Minute},
+	})
+	store.RetentionEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "served")
+	create, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create.Exec(`CREATE TABLE t (id INT, b BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := create.Close(); err != nil {
+		t.Fatal(err)
+	}
+	inner, err := NewReplicaClientFromURL("file://" + filepath.Join(dir, "replica"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &heldLevelClient{ReplicaClient: inner, level: level, held: make(chan struct{}), release: make(chan struct{})}
+	db := NewDB(path)
+	db.MonitorInterval = 0
+	db.RetentionEnabled = false
+	db.Replica = NewReplica(db)
+	db.Replica.MonitorEnabled = false
+	db.Replica.Client = client
+	if _, err := store.RegisterDB(db); err != nil {
+		t.Fatal(err)
+	}
+	app, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncAndWait := func(checkpoint bool) {
+		t.Helper()
+		if _, err := store.SyncDB(ctx, path, true, checkpoint); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert := func(n int) {
+		t.Helper()
+		if _, err := app.Exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) INSERT INTO t SELECT i, randomblob(1024) FROM n`, n); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	insert(rows)
+	syncAndWait(false)
+	if level == 1 {
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		insert(1)
+		syncAndWait(false)
+	}
+	<-client.held
+	uploaded := client.levelZero.Load()
+	insert(1)
+	syncAndWait(false)
+	insert(1)
+	syncAndWait(true)
+	insert(1)
+	syncAndWait(false)
+	if got := client.levelZero.Load() - uploaded; got < 2 {
+		t.Errorf("syncs while level %d was held uploaded %d level-zero files, want at least 2", level, got)
+	}
+
+	close(client.release)
+	synctest.Wait()
+	files, err := FindLTXFiles(ctx, inner, level, false, func(*ltx.FileInfo) (bool, error) { return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Errorf("the released level %d left no file", level)
+	}
+
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type heldLevelClient struct {
+	ReplicaClient
+	level     int
+	held      chan struct{}
+	holding   sync.Once
+	release   chan struct{}
+	levelZero atomic.Int64
+}
+
+func (c *heldLevelClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == c.level {
+		c.holding.Do(func() { close(c.held) })
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	info, err := c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	if err == nil && level == 0 {
+		c.levelZero.Add(1)
+	}
+	return info, err
 }
 
 type compactedName struct {
@@ -288,6 +418,7 @@ func dropAndIdle(t *testing.T, n int) int64 {
 	for _, db := range dbs {
 		db.write(t, store, 1)
 	}
+	synctest.Wait()
 
 	down.Store(true)
 	for _, db := range dbs {
