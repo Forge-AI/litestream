@@ -118,8 +118,7 @@ type DB struct {
 	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
 
 	owe        func(level int)
-	pay        func(ctx context.Context)
-	paying     sync.Mutex
+	pay        func()
 	pageMap    pageMapState
 	registered bool
 
@@ -472,7 +471,7 @@ func NewDB(path string) *DB {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
 	db.owe = func(int) {}
-	db.pay = func(context.Context) {}
+	db.pay = func() {}
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.abandoned, db.abandon = context.WithCancel(context.Background())
@@ -963,11 +962,7 @@ func (db *DB) syncAndWait(ctx context.Context, stage func(string)) (ltx.TXID, er
 	if err := db.Replica.Sync(ctx); err != nil {
 		return 0, fmt.Errorf("replica sync: %w", err)
 	}
-	stage("compaction")
-	db.mu.Lock()
-	life := db.ctx
-	db.mu.Unlock()
-	db.pay(life)
+	db.pay()
 	return targetTXID, nil
 }
 

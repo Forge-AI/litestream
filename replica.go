@@ -612,7 +612,7 @@ func (r *Replica) monitor(ctx context.Context) {
 			continue
 		}
 
-		r.db.pay(ctx)
+		r.db.pay()
 
 		// Success - reset backoff and error counter.
 		if consecutiveErrs > 0 {
