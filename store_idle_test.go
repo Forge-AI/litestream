@@ -418,6 +418,7 @@ func dropAndIdle(t *testing.T, n int) int64 {
 	for _, db := range dbs {
 		db.write(t, store, 1)
 	}
+	synctest.Wait()
 
 	down.Store(true)
 	for _, db := range dbs {
