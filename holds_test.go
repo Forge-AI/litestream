@@ -75,6 +75,59 @@ func TestHold_RetentionKeepsEveryFileAForkPointReadsUntilTheChildsBaseIsGone(t *
 	}
 }
 
+func TestHold_ADeadlineKeepsEveryFileAndTheBaseRecordUntilItPasses(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	parent := file.NewReplicaClient(filepath.Join(dir, "parent"))
+	compactor := litestream.NewCompactor(parent, slog.Default())
+
+	old := time.Now().Add(-2 * time.Hour)
+	createTestLTXFileWithTimestamp(t, parent, litestream.SnapshotLevel, 1, 47900, old)
+	createTestLTXFile(t, parent, litestream.SnapshotLevel, 1, 50000)
+	createTestLTXFileWithTimestamp(t, parent, 0, 48212, 50000, old)
+	createTestLTXFile(t, parent, 1, 48101, 50000)
+	compacted := []litestream.HeldFile{
+		{Level: litestream.SnapshotLevel, Min: 1, Max: 47900},
+		{Level: 0, Min: 48212, Max: 50000},
+	}
+	ownBase := parent.ObjectKey(litestream.BaseName)
+	if err := parent.WriteHead(ctx, ownBase, []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	childBase := filepath.Join(dir, "child", litestream.BaseName)
+	hold := func(until time.Time) {
+		t.Helper()
+		if err := compactor.Hold(ctx, "child", litestream.Hold{ChildBase: childBase, UntilMS: until.UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hold(time.Now().Add(time.Hour))
+	enforceRetention(t, compactor)
+	for _, f := range compacted {
+		if !hasLTXFile(t, parent, f) {
+			t.Errorf("retention deleted %+v before the hold's deadline", f)
+		}
+	}
+	if dropped, err := compactor.DropBase(ctx); err != nil || dropped {
+		t.Fatalf("a base record held until a deadline reported dropped %v: %v", dropped, err)
+	}
+
+	hold(time.Now().Add(-time.Millisecond))
+	enforceRetention(t, compactor)
+	for _, f := range compacted {
+		if hasLTXFile(t, parent, f) {
+			t.Errorf("retention kept %+v after the hold's deadline passed", f)
+		}
+	}
+	if holds := listHolds(t, parent); len(holds) != 0 {
+		t.Errorf("holds=%v after the deadline passed, want none", holds)
+	}
+	if dropped, err := compactor.DropBase(ctx); err != nil || !dropped {
+		t.Fatalf("a base record past its hold's deadline reported dropped %v: %v", dropped, err)
+	}
+}
+
 func TestHold_RefusesWhatRetentionAlreadyDeleted(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
