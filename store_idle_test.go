@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -201,6 +202,114 @@ func TestStore_ALevelCompactsOncePerIntervalAndPaysWhatItOwesAfterTheBoundary(t 
 			t.Fatal(err)
 		}
 	})
+}
+
+func TestStore_ASnapshotInFlightLeavesTheDatabasesSyncsAndLevelZeroUploadsRunning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		store := NewStore(nil, CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: time.Minute},
+		})
+		store.RetentionEnabled = false
+		if err := store.Open(ctx); err != nil {
+			t.Fatal(err)
+		}
+		dir := t.TempDir()
+		path := filepath.Join(dir, "served")
+		create, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := create.Exec(`CREATE TABLE t (id INT)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := create.Close(); err != nil {
+			t.Fatal(err)
+		}
+		inner, err := NewReplicaClientFromURL("file://" + filepath.Join(dir, "replica"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		client := &heldSnapshotClient{ReplicaClient: inner, held: make(chan struct{}), release: make(chan struct{})}
+		db := NewDB(path)
+		db.MonitorInterval = 0
+		db.RetentionEnabled = false
+		db.Replica = NewReplica(db)
+		db.Replica.MonitorEnabled = false
+		db.Replica.Client = client
+		if _, err := store.RegisterDB(db); err != nil {
+			t.Fatal(err)
+		}
+		app, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeAndSync := func(i int, checkpoint bool) {
+			t.Helper()
+			if _, err := app.Exec(`INSERT INTO t VALUES (?)`, i); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.SyncDB(ctx, path, true, checkpoint); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		writeAndSync(0, false)
+		<-client.held
+		uploaded := client.levelZero.Load()
+		writeAndSync(1, false)
+		if got := client.levelZero.Load(); got <= uploaded {
+			t.Errorf("a waiting sync during the snapshot uploaded %d level-zero files, want at least one", got-uploaded)
+		}
+		time.Sleep(time.Minute)
+		writeAndSync(2, true)
+		writeAndSync(3, false)
+		if got := client.levelZero.Load(); got <= uploaded+1 {
+			t.Errorf("syncs a minute into the snapshot uploaded %d level-zero files, want at least two", got-uploaded)
+		}
+
+		close(client.release)
+		synctest.Wait()
+		snapshots, err := FindLTXFiles(ctx, inner, SnapshotLevel, false, func(*ltx.FileInfo) (bool, error) { return true, nil })
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 1 {
+			t.Errorf("the released snapshot left %d level-9 files, want 1", len(snapshots))
+		}
+
+		if err := app.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+type heldSnapshotClient struct {
+	ReplicaClient
+	held      chan struct{}
+	holding   sync.Once
+	release   chan struct{}
+	levelZero atomic.Int64
+}
+
+func (c *heldSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == SnapshotLevel {
+		c.holding.Do(func() { close(c.held) })
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	info, err := c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	if err == nil && level == 0 {
+		c.levelZero.Add(1)
+	}
+	return info, err
 }
 
 type compactedName struct {

@@ -111,8 +111,9 @@ type Store struct {
 	cancel func()
 	done   <-chan struct{}
 
-	owed      map[int]map[*DB]struct{}
-	compacted map[int]map[*DB]time.Time
+	owed          map[int]map[*DB]struct{}
+	compacted     map[int]map[*DB]time.Time
+	snapshotsOwed chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -124,8 +125,10 @@ type Store struct {
 	// How often to check for expired L0 files.
 	L0RetentionCheckInterval time.Duration
 
-	// If true, each replica sync pays the compactions, snapshot and retention
-	// its database owes once their level is due.
+	// If true, each replica sync pays the compactions its database owes once
+	// their level is due. A sync-driven database pays its snapshot and
+	// retention there too; every other database hands them to the store's
+	// snapshot goroutine, so a full snapshot never holds up the sync.
 	CompactionMonitorEnabled bool
 
 	// If true, verify TXID consistency at destination level after each compaction.
@@ -177,6 +180,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
 		owed:                     map[int]map[*DB]struct{}{SnapshotLevel: {}},
 		compacted:                map[int]map[*DB]time.Time{SnapshotLevel: {}},
+		snapshotsOwed:            make(chan struct{}, 1),
 	}
 	for _, lvl := range levels {
 		s.owed[lvl.Level] = map[*DB]struct{}{}
@@ -243,6 +247,14 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
+	if s.CompactionMonitorEnabled {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.paySnapshots(s.ctx)
+		}()
+	}
+
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
 
@@ -259,8 +271,9 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	// Stop the store's monitors before closing the databases. Each database's
-	// Close cancels the compactions, snapshots and retention its syncs pay.
+	// Stop the store's monitors and its snapshot goroutine before closing the
+	// databases. Each database's Close cancels the compactions, snapshot and
+	// retention it is paying.
 	s.cancel()
 	s.wg.Wait()
 
@@ -406,8 +419,12 @@ func (s *Store) owe(db *DB, level int) {
 func (s *Store) takeOwed(db *DB) CompactionLevels {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	levels := s.levels
+	if db.SyncDriven {
+		levels = append(slices.Clone(s.levels), s.SnapshotLevel())
+	}
 	var owed CompactionLevels
-	for _, lvl := range append(slices.Clone(s.levels), s.SnapshotLevel()) {
+	for _, lvl := range levels {
 		if _, ok := s.owed[lvl.Level][db]; ok {
 			delete(s.owed[lvl.Level], db)
 			owed = append(owed, lvl)
@@ -419,6 +436,15 @@ func (s *Store) takeOwed(db *DB) CompactionLevels {
 func (s *Store) pay(ctx context.Context, db *DB) {
 	if !s.CompactionMonitorEnabled {
 		return
+	}
+	s.mu.Lock()
+	_, snapshotOwed := s.owed[SnapshotLevel][db]
+	s.mu.Unlock()
+	if snapshotOwed && !db.SyncDriven {
+		select {
+		case s.snapshotsOwed <- struct{}{}:
+		default:
+		}
 	}
 	db.paying.Lock()
 	defer db.paying.Unlock()
@@ -432,6 +458,38 @@ func (s *Store) pay(ctx context.Context, db *DB) {
 	}
 	for _, lvl := range kept {
 		s.owe(db, lvl.Level)
+	}
+}
+
+func (s *Store) paySnapshots(ctx context.Context) {
+	lvl := s.SnapshotLevel()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.snapshotsOwed:
+		}
+		s.mu.Lock()
+		var owed []*DB
+		for db := range s.owed[SnapshotLevel] {
+			if !db.SyncDriven {
+				delete(s.owed[SnapshotLevel], db)
+				owed = append(owed, db)
+			}
+		}
+		s.mu.Unlock()
+		for _, db := range owed {
+			db.mu.Lock()
+			life := db.ctx
+			db.mu.Unlock()
+			snapshotCtx, cancel := context.WithCancel(ctx)
+			stop := context.AfterFunc(life, cancel)
+			if s.payLevel(snapshotCtx, db, lvl) {
+				s.owe(db, SnapshotLevel)
+			}
+			stop()
+			cancel()
+		}
 	}
 }
 
