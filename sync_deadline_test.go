@@ -130,12 +130,6 @@ func TestStore_SyncDeadlineNamesTheStagesAfterTheLocalSync(t *testing.T) {
 		{"replica_sync", func(db *DB, entered, release chan struct{}) {
 			db.Replica.Client = &syncDeadlineUploadClient{ReplicaClient: db.Replica.Client, entered: entered, release: release}
 		}},
-		{"compaction", func(db *DB, entered, release chan struct{}) {
-			db.pay = func(context.Context) {
-				close(entered)
-				<-release
-			}
-		}},
 	} {
 		t.Run(tc.phase, func(t *testing.T) {
 			db := openReplicatedDB(t)
