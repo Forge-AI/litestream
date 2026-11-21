@@ -86,6 +86,7 @@ func TestHold_ADeadlineKeepsEveryFileAndTheBaseRecordUntilItPasses(t *testing.T)
 	createTestLTXFile(t, parent, litestream.SnapshotLevel, 1, 50000)
 	createTestLTXFileWithTimestamp(t, parent, 0, 48212, 50000, old)
 	createTestLTXFile(t, parent, 1, 48101, 50000)
+	createTestLTXFile(t, parent, 0, 50001, 50001)
 	compacted := []litestream.HeldFile{
 		{Level: litestream.SnapshotLevel, Min: 1, Max: 47900},
 		{Level: 0, Min: 48212, Max: 50000},
