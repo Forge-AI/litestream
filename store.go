@@ -112,6 +112,10 @@ type Store struct {
 	cancel func()
 	done   <-chan struct{}
 
+	payers   sync.WaitGroup
+	draining context.Context
+	drain    func()
+
 	owed      map[int]map[*DB]struct{}
 	compacted map[int]map[*DB]time.Time
 	wakes     map[int]chan struct{}
@@ -202,6 +206,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.RetentionEnabled = s.RetentionEnabled && db.RetentionEnabled
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.draining, s.drain = context.WithCancel(context.Background())
 	return s
 }
 
@@ -252,9 +257,9 @@ func (s *Store) Open(ctx context.Context) error {
 
 	if s.CompactionMonitorEnabled {
 		for _, lvl := range append(slices.Clone(s.levels[1:]), s.SnapshotLevel()) {
-			s.wg.Add(1)
+			s.payers.Add(1)
 			go func() {
-				defer s.wg.Done()
+				defer s.payers.Done()
 				s.payLevelOwed(s.ctx, lvl)
 			}()
 		}
@@ -276,15 +281,24 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	// Stop the store's monitors and compaction goroutines before closing the
-	// databases. Each database's Close cancels the compaction, snapshot or
-	// retention running for it.
-	s.cancel()
-	s.wg.Wait()
+	// Pay what each database owes before stopping, so the replica restores at
+	// what the last sync shipped. Close's ctx bounds the payments.
+	stop := context.AfterFunc(ctx, s.cancel)
+	defer stop()
+	s.drain()
+	s.payers.Wait()
 
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
+	if s.CompactionMonitorEnabled {
+		for _, db := range dbs {
+			s.payOwed(s.ctx, db)
+		}
+	}
+
+	s.cancel()
+	s.wg.Wait()
 
 	for _, db := range dbs {
 		if e := db.Close(ctx); e != nil {
@@ -437,10 +451,39 @@ func (s *Store) pay(db *DB) {
 	}
 }
 
+func (s *Store) payOwed(ctx context.Context, db *DB) {
+	var kept CompactionLevels
+	for owed := s.takeOwed(db); len(owed) > 0; owed = s.takeOwed(db) {
+		for _, lvl := range owed {
+			if s.payLevel(ctx, db, lvl) {
+				kept = append(kept, lvl)
+			}
+		}
+	}
+	for _, lvl := range kept {
+		s.owe(db, lvl.Level)
+	}
+}
+
+func (s *Store) takeOwed(db *DB) CompactionLevels {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var owed CompactionLevels
+	for _, lvl := range append(slices.Clone(s.levels[1:]), s.SnapshotLevel()) {
+		if _, ok := s.owed[lvl.Level][db]; ok {
+			delete(s.owed[lvl.Level], db)
+			owed = append(owed, lvl)
+		}
+	}
+	return owed
+}
+
 func (s *Store) payLevelOwed(ctx context.Context, lvl *CompactionLevel) {
 	for {
 		select {
 		case <-ctx.Done():
+			return
+		case <-s.draining.Done():
 			return
 		case <-s.wakes[lvl.Level]:
 		}
