@@ -9,6 +9,7 @@ import (
 	"path"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -32,11 +33,16 @@ type HoldClient interface {
 }
 
 // Hold keeps Files, and this replica's own base record when Base is set, until
-// the child's base record at ChildBase is gone.
+// the child's base record at ChildBase is gone. A hold with UntilMS keeps every
+// file and the base record, and outlives an absent child base record until that
+// Unix time in milliseconds: a fork's clone sends one before its child has a
+// base record, and the child's first attach replaces it with a hold on the
+// files its base record names.
 type Hold struct {
 	ChildBase string     `json:"child_base"`
 	Files     []HeldFile `json:"files"`
 	Base      bool       `json:"base,omitempty"`
+	UntilMS   int64      `json:"until_ms,omitempty"`
 }
 
 type HeldFile struct {
@@ -46,6 +52,9 @@ type HeldFile struct {
 }
 
 func (h Hold) names(info *ltx.FileInfo) bool {
+	if h.UntilMS != 0 {
+		return true
+	}
 	for _, f := range h.Files {
 		if f.Level == info.Level && ltx.TXID(f.Min) == info.MinTXID && ltx.TXID(f.Max) == info.MaxTXID {
 			return true
@@ -100,7 +109,7 @@ func (c *Compactor) DropBase(ctx context.Context) (bool, error) {
 	}
 	c.holds.mu.Lock()
 	defer c.holds.mu.Unlock()
-	held, err := c.liveHolds(ctx, client, func(h Hold) bool { return h.Base })
+	held, err := c.liveHolds(ctx, client, func(h Hold) bool { return h.Base || h.UntilMS != 0 })
 	if err != nil || len(held) > 0 {
 		return false, err
 	}
@@ -152,6 +161,10 @@ func (c *Compactor) liveHolds(ctx context.Context, client HoldClient, match func
 		}
 		if !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("read the base record %s hold %s keeps files for: %w", hold.ChildBase, key, err)
+		}
+		if time.Now().UnixMilli() < hold.UntilMS {
+			live = append(live, hold)
+			continue
 		}
 		if err := client.DeleteHead(ctx, key); err != nil {
 			return nil, fmt.Errorf("delete hold %s: %w", key, err)
